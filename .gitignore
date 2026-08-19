@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.py[cod]
+
+# Build artifacts
+build/
+dist/
+
+# Tool run outputs (generated CSV / reports / logs)
+outputs/
+release/
+
+# Term-table data (not used in this no-term-table version)
+data/
+TermTable_15Lang.csv
+
+# Other edition (full translator with term table) — not part of this repo
+app/qxqy_translator_gui.py
+qxqy_translator.spec
+QXQY_15Lang_Translator.spec
+run_translate.bat
+tools/generate_icon.py
+
+# Archives
+*.zip
+
+# One-off helper scripts with hardcoded local paths
+fix_quotes.py
+
+# IDE / OS
+.vscode/
+.idea/
+*.log
