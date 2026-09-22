@@ -35,7 +35,7 @@ class GlossaryDialog:
         self.confirm_button.pack(side="right")
         ttk.Button(buttons, text="取消", style="Text.TButton", command=self.close).pack(side="right", padx=10)
         ttk.Button(buttons, text="自动识别列名", style="Text.TButton", command=self.auto_map).pack(side="left")
-        scroll = carbon_theme.ScrollableFrame(outer, colors={"background": "#f4f4f4"})
+        scroll = carbon_theme.ScrollableFrame(outer, colors={"background": "#f3f8fc"})
         scroll.pack(fill="both", expand=True)
         body = scroll.content
         heading = ttk.Label(body, text=path.name, style="Headline.TLabel", wraplength=650)

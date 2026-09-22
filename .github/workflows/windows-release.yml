@@ -1,0 +1,64 @@
+name: Windows release
+
+on:
+  push:
+    branches: [master]
+    paths:
+      - 'docs/releases/*.md'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    if: github.event_name == 'workflow_dispatch' || contains(github.event.head_commit.message, '[release]')
+    runs-on: windows-latest
+    timeout-minutes: 20
+    permissions:
+      contents: write
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: '3.13'
+          architecture: x64
+      - name: Install build dependencies
+        run: python -m pip install pyinstaller==6.18.0 rapidfuzz==3.14.5
+      - name: Test application and documented prompts
+        run: |
+          python -m unittest discover -s tests -v
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python tools/sync_readme_prompts.py --check
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Build Windows executable
+        run: python -m PyInstaller QXQY_Direct_Translator.spec --noconfirm --distpath dist/release --workpath build/release
+      - name: Audit and package public assets
+        run: python tools/package_release.py
+      - name: Publish release after assets are uploaded
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          PYTHONUTF8: '1'
+        run: |
+          $releaseVersion = python tools/package_release.py --version
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $releaseNotes = "docs/releases/$releaseVersion.md"
+          if (-not (Test-Path -LiteralPath $releaseNotes)) { throw "Missing release notes" }
+          gh release view $releaseVersion --json tagName --jq .tagName
+          if ($LASTEXITCODE -eq 0) { throw "This release already exists; it will not be overwritten" }
+          $releaseAssets = Get-ChildItem -LiteralPath "release/$releaseVersion" -File | ForEach-Object { $_.FullName }
+          if ($releaseAssets.Count -ne 3) { throw "Expected EXE, ZIP and SHA256SUMS.txt" }
+          gh release create $releaseVersion @releaseAssets --target $env:GITHUB_SHA --title "$releaseVersion · 浅蓝主题与自定义术语表" --notes-file $releaseNotes --draft
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          gh release edit $releaseVersion --draft=false --latest
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }

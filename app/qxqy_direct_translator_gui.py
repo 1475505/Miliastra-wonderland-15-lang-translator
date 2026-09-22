@@ -50,7 +50,7 @@ def app_dir() -> Path:
 
 
 CONFIG_PATH = app_dir() / "settings.json"
-APP_VERSION = "v1.06"
+APP_VERSION = "v1.07"
 MAX_RECENT_FILES = 5
 
 

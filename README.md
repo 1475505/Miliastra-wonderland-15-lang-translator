@@ -9,6 +9,8 @@
 
 ## 运行和使用
 
+Windows 用户可直接下载 [v1.07 程序（免安装）](https://github.com/1475505/Miliastra-wonderland-15-lang-translator/releases/tag/v1.07)。单独 EXE 即可运行；ZIP 额外包含说明和自编格式示例。
+
 源码运行需要 Python 3.10+，以及可用的 Tkinter（Windows 官方 Python 安装器可包含）。核心功能仅依赖 Python 标准库；`rapidfuzz` 是可选的术语匹配加速库。
 
 ```powershell
@@ -22,7 +24,7 @@ python app/qxqy_direct_translator_gui.py
 
 默认模型为 `deepseek-flash`，默认服务地址为 `https://api.deepseek.com/chat/completions`。根据 [DeepSeek 2026-09-10 官方更新](https://api-docs.deepseek.com/news/news260910/)，它对应 DeepSeek-V4.1-Flash。应用会将官方接口上保存的旧默认值 `deepseek-v4-flash` 更新为新名称；自定义接口和其他模型名称保持用户设置。
 
-界面参考 [IBM Carbon 的多步骤引导](https://carbondesignsystem.com/components/progress-indicator/usage/)与[表单规范](https://carbondesignsystem.com/patterns/forms-pattern/)，采用深色顶栏、灰白工作区、蓝色主操作和左对齐表单。首次打开即显示模型服务，不再把必填配置藏在页签中。高级并发与保存参数默认折叠。缺少 API Key、输入列或参数无效时，会在页面内提示并定位到对应字段；运行中会锁定配置，防止中途修改。完成和暂停不会弹出阻塞式提示框。此项目与 IBM 无关联。
+界面参考 [IBM Carbon 的多步骤引导](https://carbondesignsystem.com/components/progress-indicator/usage/)与[表单规范](https://carbondesignsystem.com/patterns/forms-pattern/)，采用浅蓝顶栏、蓝白工作区、浅蓝主操作和左对齐表单。首次打开即显示模型服务，不再把必填配置藏在页签中。高级并发与保存参数默认折叠。缺少 API Key、输入列或参数无效时，会在页面内提示并定位到对应字段；运行中会锁定配置，防止中途修改。完成和暂停不会弹出阻塞式提示框。勾选框使用清晰的对勾图标，键盘焦点显示在方框外缘，支持空格切换。此项目与 IBM 无关联。
 
 暂停后不再派发新请求，会等待当前请求返回并保存译文，再进入可继续状态。运行中关闭窗口时，可选择等待保存后退出。日志支持复制；查看旧日志时不会强制滚动到底部。
 
@@ -200,3 +202,9 @@ python -m PyInstaller QXQY_Direct_Translator.spec --clean --noconfirm
 ## 仓库数据边界
 
 `.gitignore` 排除了 `data/`、`TermTable_15Lang.*`、`glossaries/`、本地 `custom_terms*.csv/tsv`、`settings.json`、输出、构建产物和压缩包；旧的本地完整版入口和打包配置也保持排除。仓库仅提供源码、说明和自编示例，不包含原神内置术语表。忽略规则不阻止显式强制提交，发布前仍应检查待提交文件清单。
+
+## 维护发布
+
+Windows 发布流程见 `.github/workflows/windows-release.yml`：运行测试、构建程序、审计打包内容，再上传 EXE、ZIP 和校验文件到 GitHub Release。构建与压缩包使用明确的文件清单，不包含本机设置或个人术语表。
+
+发布新版本时，更新 `APP_VERSION` 和 `docs/releases/版本号.md`，以带 `[release]` 的提交消息推送到 master；也可以在 GitHub Actions 手动运行 Windows release。已存在的 Release 不会被覆盖。
