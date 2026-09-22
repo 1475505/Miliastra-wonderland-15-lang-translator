@@ -11,7 +11,7 @@ import threading
 import time
 import traceback
 from pathlib import Path
-from tkinter import BooleanVar, TclError, Menu, PhotoImage, StringVar, Text, Tk, filedialog, messagebox, ttk
+from tkinter import BooleanVar, TclError, Menu, StringVar, Text, Tk, filedialog, messagebox, ttk
 
 if sys.platform == "win32":
     import ctypes
@@ -23,8 +23,8 @@ for _p in (str(TOOLS), str(APP_DIR)):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
-import m3_theme  # noqa: E402
-from ui_helpers import inspect_input, bounded_integer, validate_endpoint, duration_label
+import carbon_theme  # noqa: E402
+from ui_helpers import inspect_input, bounded_integer, validate_endpoint, duration_label, initial_model
 from custom_glossary import read_glossary  # noqa: E402
 from glossary_dialog import GlossaryDialog  # noqa: E402
 
@@ -50,7 +50,7 @@ def app_dir() -> Path:
 
 
 CONFIG_PATH = app_dir() / "settings.json"
-APP_VERSION = "v1.05"
+APP_VERSION = "v1.06"
 MAX_RECENT_FILES = 5
 
 
@@ -81,7 +81,7 @@ class DirectTranslatorApp:
             except Exception:
                 pass
         self.scale = max(1.0, float(self.root.tk.call("tk", "scaling")) / (96 / 72))
-        self.m3_colors = m3_theme.apply_m3_theme(self.root)
+        self.m3_colors = carbon_theme.apply_carbon_theme(self.root)
         self._saved_geometry = str(saved.get("window_geometry", ""))
         try:
             self.root.iconbitmap(str(resource_path("app/icon.ico")))
@@ -98,7 +98,7 @@ class DirectTranslatorApp:
         self.force_translate_all = BooleanVar(value=False)
         self.run_stage3 = BooleanVar(value=bool(saved.get("run_stage3", False)))
         self.llm_endpoint = StringVar(value=str(saved.get("llm_endpoint", DEFAULT_ENDPOINT)))
-        self.llm_model = StringVar(value=str(saved.get("llm_model", DEFAULT_MODEL)))
+        self.llm_model = StringVar(value=initial_model(saved))
         self.llm_api_key = StringVar(value=str(saved.get("llm_api_key", os.getenv("DEEPSEEK_API_KEY", ""))))
         self.llm_threads = StringVar(value=str(saved.get("llm_threads", 3)))
         self.flush_interval = StringVar(value=str(saved.get("flush_interval", 5)))
@@ -107,7 +107,7 @@ class DirectTranslatorApp:
         self.glossary_summary = StringVar(value="可选 · 不导入时直接翻译")
         self.form_feedback = StringVar()
         self.status_title = StringVar(value="准备开始")
-        self.status_detail = StringVar(value="选择输入文件，确认模型设置后开始翻译。")
+        self.status_detail = StringVar(value="完成模型服务与翻译内容两步配置后，开始翻译。")
         self.count_text = StringVar(value="—")
         self.elapsed_text = StringVar(value="00:00")
         self.progress_text = StringVar(value="尚未开始")
@@ -121,20 +121,24 @@ class DirectTranslatorApp:
         self._output_path = self._report_path = None
         self._locked_widgets = []
         self._progress_limit = 100
+        self._step = 0
+        self._service_confirmed = False
         self._build()
         self._fit_window()
         self._refresh_glossary_summary()
         for variable in (self.input_path, self.overwrite, self.force_translate_all):
             variable.trace_add("write", self._schedule_preview)
         self.root.bind("<Control-o>", lambda _e: self.choose_input())
-        self.root.bind("<Control-Return>", lambda _e: self.run())
+        self.root.bind("<Control-Return>", lambda _e: self._primary_action())
         self.root.bind("<Control-period>", lambda _e: self.stop())
         self.root.bind("<F1>", lambda _e: self.show_help())
         self.root.after(80, self._poll_messages)
         self.root.after(1000, self._tick)
-        self.root.after(150, lambda: self._body_pane.sashpos(0, int(self._body_pane.winfo_width() * 0.57)))
+        self.root.after(150, self.api_key_entry.focus_set)
+        for variable in (self.llm_endpoint, self.llm_model, self.llm_api_key):
+            variable.trace_add("write", self._service_changed)
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
-        self._append_log("准备就绪。先选择输入文件；术语表可选。")
+        self._append_log("准备就绪。请先确认模型服务，再选择翻译文件。")
 
     def _load_settings(self):
         try:
@@ -156,7 +160,7 @@ class DirectTranslatorApp:
     def _fit_window(self):
         sw, sh = self.root.winfo_screenwidth(), self.root.winfo_screenheight()
         max_w, max_h = max(600, sw - 40), max(440, sh - 90)
-        width, height = int(1180 * self.scale), int(820 * self.scale)
+        width, height = int(1240 * self.scale), int(820 * self.scale)
         try:
             geometry = self._saved_geometry.split("+")[0].split("-")[0].split("x")
             if len(geometry) == 2:
@@ -168,12 +172,13 @@ class DirectTranslatorApp:
         self.root.geometry(f"{width}x{height}+{max(0,(sw-width)//2)}+{max(0,(sh-height)//3)}")
         self.root.minsize(min_w, min_h)
 
-    def _wrap(self, label, parent, margin=36):
-        parent.bind("<Configure>", lambda e: label.configure(wraplength=max(100, e.width-margin)), add="+")
+    def _wrap(self, label, parent, margin=None):
+        margin = self._u(40) if margin is None else margin
+        parent.bind("<Configure>", lambda e: label.configure(wraplength=max(80, e.width-margin-4)), add="+")
 
     def _card(self, parent, title, subtitle=None):
-        card = ttk.Frame(parent, style="Card.TFrame", padding=16)
-        card.pack(fill="x", pady=(0, 12))
+        card = ttk.Frame(parent, style="Card.TFrame", padding=self._u(20))
+        card.pack(fill="x", pady=(0, self._u(16)))
         ttk.Label(card, text=title, style="Section.TLabel").pack(anchor="w", pady=(0, 10))
         if subtitle:
             label = ttk.Label(card, text=subtitle, style="CardCaption.TLabel", wraplength=380)
@@ -181,84 +186,120 @@ class DirectTranslatorApp:
             self._wrap(label, card)
         return card
 
+    def _u(self, value):
+        return round(value * self.scale)
+
+    def _columns(self, page, weights=(3, 2)):
+        page.rowconfigure(0, weight=1)
+        panes = []
+        for index, weight in enumerate(weights):
+            page.columnconfigure(index, weight=weight, uniform="content")
+            frame = ttk.Frame(page, width=1)
+            frame.grid(row=0, column=index, sticky="nsew",
+                       padx=(0, self._u(16)) if index == 0 else 0)
+            frame.pack_propagate(False)
+            panes.append(frame)
+        return panes
+
     def _build(self):
         c = self.m3_colors
-        outer = ttk.Frame(self.root, padding=18)
-        outer.pack(fill="both", expand=True)
-        header = ttk.Frame(outer)
-        header.pack(fill="x", pady=(0, 16))
-        ttk.Button(header, text="使用说明  F1", style="Text.TButton", command=self.show_help).pack(side="right")
-        try:
-            self._logo_img = PhotoImage(file=str(resource_path("app/app_logo.png"))).subsample(3, 3)
-            ttk.Label(header, image=self._logo_img).pack(side="left", padx=(0, 12))
-        except TclError:
-            pass
-        titles = ttk.Frame(header)
-        titles.pack(side="left", fill="x", expand=True)
-        ttk.Label(titles, text="千星奇域 · 多语言翻译", style="Title.TLabel").pack(anchor="w")
-        ttk.Label(titles, text="简体中文 → 14 种语言    /    自定义术语 · 统一译名", style="Caption.TLabel").pack(anchor="w", pady=(3, 0))
-        footer = ttk.Frame(outer)
-        footer.pack(side="bottom", fill="x", pady=(12, 0))
-        actions = ttk.Frame(footer)
-        actions.pack(fill="x")
-        self.run_button = ttk.Button(actions, text="开始翻译", style="M3.TButton", command=self.run)
-        self.run_button.pack(side="right", padx=(8, 0))
-        self.stop_button = ttk.Button(actions, text="暂停", style="Tonal.TButton", command=self.stop, state="disabled")
-        self.stop_button.pack(side="right")
-        ttk.Label(actions, text="Ctrl+O  选择文件\nCtrl+Enter  开始 / 继续", style="Caption.TLabel").pack(side="left")
-        ttk.Label(footer, text=f"{APP_VERSION}  ·  仅供学习交流，禁止售卖  ·  QQ 群 1007538100",
-                  style="Caption.TLabel").pack(anchor="w", pady=(10, 0))
-        self._body_pane = ttk.PanedWindow(outer, orient="horizontal")
-        self._body_pane.pack(fill="both", expand=True)
-        left, right = ttk.Frame(self._body_pane), ttk.Frame(self._body_pane)
-        self._body_pane.add(left, weight=3)
-        self._body_pane.add(right, weight=2)
-        self.workspace_tabs = ttk.Notebook(left)
-        self.workspace_tabs.pack(fill="both", expand=True, padx=(0, 12))
-        self.task_panel = m3_theme.ScrollableFrame(self.workspace_tabs, colors=c)
-        self.settings_panel = m3_theme.ScrollableFrame(self.workspace_tabs, colors=c)
-        self.workspace_tabs.add(self.task_panel, text="翻译任务")
-        self.workspace_tabs.add(self.settings_panel, text="模型设置")
-        self._build_task_form(self.task_panel.content)
+        shell = ttk.Frame(self.root, style="Shell.TFrame", padding=(self._u(24), self._u(8)))
+        shell.pack(fill="x")
+        ttk.Label(shell, text="千星奇域", style="Shell.TLabel").pack(side="left")
+        ttk.Label(shell, text=" /  多语言翻译", style="ShellCaption.TLabel").pack(side="left", padx=(8, 0))
+        ttk.Button(shell, text="使用说明  ↗", style="Shell.TButton", command=self.show_help).pack(side="right")
+        ttk.Label(shell, text=APP_VERSION, style="ShellCaption.TLabel").pack(side="right", padx=16)
+
+        workspace = ttk.Frame(self.root)
+        workspace.pack(fill="both", expand=True)
+        self.navigation = ttk.Frame(workspace, style="Card.TFrame", width=self._u(192))
+        self.navigation.pack(side="left", fill="y")
+        self.navigation.pack_propagate(False)
+        ttk.Label(self.navigation, text="翻译工作流", style="NavCaption.TLabel").pack(
+            anchor="w", padx=self._u(24), pady=(self._u(28), self._u(20)))
+        self.step_buttons, self.step_lines = [], []
+        for index in range(3):
+            row = ttk.Frame(self.navigation, style="Card.TFrame")
+            row.pack(fill="x", pady=(0, 4))
+            line = ttk.Frame(row, width=self._u(3), style="Card.TFrame")
+            line.pack(side="left", fill="y")
+            button = ttk.Button(row, style="Nav.TButton", command=lambda i=index: self._go_step(i))
+            button.pack(side="left", fill="x", expand=True)
+            self.step_buttons.append(button)
+            self.step_lines.append(line)
+        ttk.Label(self.navigation, text="简体中文 → 14 种语言\n\n支持 CSV / TSV 术语表\n可自定义语言列\n\n仅供学习交流，禁止售卖",
+                  style="NavCaption.TLabel", justify="left").pack(
+                      side="bottom", anchor="w", padx=self._u(24), pady=self._u(24))
+
+        main = ttk.Frame(workspace)
+        main.pack(fill="both", expand=True)
+        footer = ttk.Frame(main, style="Card.TFrame", padding=(self._u(24), self._u(12)))
+        footer.pack(side="bottom", fill="x")
+        self.run_button = ttk.Button(footer, text="保存并继续  →", width=18,
+                                     style="M3.TButton", command=self._primary_action)
+        self.run_button.pack(side="right")
+        self.stop_button = ttk.Button(footer, text="暂停", style="Tonal.TButton",
+                                      command=self.stop, state="disabled")
+        self.back_button = ttk.Button(footer, text="←  上一步", style="Text.TButton",
+                                      command=lambda: self._go_step(max(0, self._step - 1)))
+        self.back_button.pack(side="left")
+        self.footer_hint = StringVar()
+        self.footer_hint_label = ttk.Label(footer, textvariable=self.footer_hint, style="CardCaption.TLabel")
+        self.footer_hint_label.pack(side="left", padx=12)
+        footer.bind("<Configure>", self._fit_footer)
+
+        content = ttk.Frame(main, padding=(self._u(24), self._u(20), self._u(24), self._u(12)))
+        content.pack(fill="both", expand=True)
+        self.step_kicker = StringVar()
+        self.page_title = StringVar()
+        self.page_description = StringVar()
+        ttk.Label(content, textvariable=self.step_kicker, style="Eyebrow.TLabel").pack(anchor="w")
+        ttk.Label(content, textvariable=self.page_title, style="Title.TLabel").pack(anchor="w", pady=(4, 6))
+        description = ttk.Label(content, textvariable=self.page_description, style="Caption.TLabel")
+        description.pack(fill="x", pady=(0, self._u(20)))
+        self._wrap(description, content, self._u(48))
+        self.feedback_label = ttk.Label(content, textvariable=self.form_feedback,
+                                        foreground=c["error"], style="Caption.TLabel")
+        self.feedback_label.pack(side="bottom", fill="x", pady=(8, 0))
+        self._wrap(self.feedback_label, content, self._u(48))
+        deck = ttk.Frame(content)
+        deck.pack(fill="both", expand=True)
+        self.pages = [ttk.Frame(deck) for _ in range(3)]
+
+        service_left, service_right = self._columns(self.pages[0])
+        self.settings_panel = carbon_theme.ScrollableFrame(service_left, colors=c)
+        self.settings_panel.pack(fill="both", expand=True)
         self._build_settings(self.settings_panel.content)
-        self.feedback_label = ttk.Label(left, textvariable=self.form_feedback, foreground=c["error"],
-                                        style="Caption.TLabel", wraplength=400)
-        self.feedback_label.pack(fill="x", pady=(6, 0))
-        self._wrap(self.feedback_label, left)
-        status = self._card(right, "本次任务")
-        self.status_label = ttk.Label(status, textvariable=self.status_title, style="Status.TLabel")
-        self.status_label.pack(anchor="w")
-        detail = ttk.Label(status, textvariable=self.status_detail, style="CardCaption.TLabel", wraplength=320)
-        detail.pack(fill="x", pady=(7, 14))
-        self._wrap(detail, status)
-        metrics = ttk.Frame(status, style="Card.TFrame")
-        metrics.pack(fill="x")
-        for column, (caption, variable) in enumerate((("文本组", self.count_text), ("已用时间", self.elapsed_text))):
-            metrics.columnconfigure(column, weight=1)
-            ttk.Label(metrics, text=caption, style="CardCaption.TLabel").grid(row=0, column=column, sticky="w")
-            ttk.Label(metrics, textvariable=variable, style="Metric.TLabel").grid(row=1, column=column, sticky="w", pady=(3, 10))
-        self.progress = ttk.Progressbar(status, maximum=100, mode="determinate")
-        self.progress.pack(fill="x")
-        ttk.Label(status, textvariable=self.progress_text, style="CardCaption.TLabel").pack(anchor="w", pady=(7, 0))
-        self.result_card = self._card(right, "输出文件")
-        result_label = ttk.Label(self.result_card, textvariable=self.result_summary, style="CardCaption.TLabel", wraplength=320)
-        result_label.pack(fill="x", pady=(0, 10))
-        self._wrap(result_label, self.result_card)
-        row = ttk.Frame(self.result_card, style="Card.TFrame")
-        row.pack(fill="x")
-        self.result_button = ttk.Button(row, text="打开结果", style="Compact.TButton", command=lambda: self._open_path(self._output_path))
-        self.result_button.pack(side="left", padx=(0, 6))
-        self.report_button = ttk.Button(row, text="查看报告", style="Compact.TButton", command=lambda: self._open_path(self._report_path))
-        self.report_button.pack(side="left", padx=(0, 6))
-        ttk.Button(row, text="所在文件夹", style="Compact.TButton", command=self.open_output_dir).pack(side="left")
-        self.result_card.pack_forget()
-        self.detail_tabs = ttk.Notebook(right)
-        self.detail_tabs.pack(fill="both", expand=True)
-        self.preview_tab = ttk.Frame(self.detail_tabs, padding=10, style="Card.TFrame")
-        self.log_tab = ttk.Frame(self.detail_tabs, padding=10, style="Card.TFrame")
-        self.detail_tabs.add(self.preview_tab, text="输入预览")
-        self.detail_tabs.add(self.log_tab, text="运行日志")
-        ttk.Label(self.preview_tab, text="预览前 30 行 · 原始文件保持不变", style="CardCaption.TLabel").pack(anchor="w", pady=(0, 8))
+        guide_scroll = carbon_theme.ScrollableFrame(service_right, colors=c)
+        guide_scroll.pack(fill="both", expand=True)
+        self.service_guide = self._card(guide_scroll.content, "从这里开始",
+            "默认已填好 DeepSeek 的服务地址和模型。填写 API Key 后，即可进入下一步。")
+        for number, title, body in (
+            ("01", "准备模型服务", "在服务商控制台创建 API Key，并确认账号可用。"),
+            ("02", "填写访问凭据", "使用其他服务商时，同时修改服务地址和模型名称。"),
+            ("03", "保存并继续", "下一步选择翻译文件，也可以导入自己的术语表。"),
+        ):
+            ttk.Label(self.service_guide, text=number + "  " + title, style="Card.TLabel").pack(
+                anchor="w", pady=(12, 6))
+            label = ttk.Label(self.service_guide, text=body, style="CardCaption.TLabel", wraplength=260)
+            label.pack(fill="x", pady=(0, 8))
+            self._wrap(label, self.service_guide, self._u(40))
+        ttk.Separator(self.service_guide).pack(fill="x", pady=12)
+        label = ttk.Label(self.service_guide, text="保存只检查填写格式。接口能否访问、Key 是否有效，会在实际翻译时确认。",
+                          style="CardCaption.TLabel", wraplength=260)
+        label.pack(fill="x")
+        self._wrap(label, self.service_guide, self._u(40))
+
+        task_left, task_right = self._columns(self.pages[1])
+        self.task_panel = carbon_theme.ScrollableFrame(task_left, colors=c)
+        self.task_panel.pack(fill="both", expand=True)
+        self._build_task_form(self.task_panel.content)
+        self.preview_tab = ttk.Frame(task_right, style="Card.TFrame", padding=self._u(20))
+        self.preview_tab.pack(fill="both", expand=True)
+        ttk.Label(self.preview_tab, text="文件预览", style="Section.TLabel").pack(anchor="w", pady=(0, 10))
+        caption = ttk.Label(self.preview_tab, text="前 30 行 · 不改动原文件", style="CardCaption.TLabel")
+        caption.pack(fill="x", pady=(0, 8))
+        self._wrap(caption, self.preview_tab, self._u(40))
         tree_frame = ttk.Frame(self.preview_tab, style="Card.TFrame")
         tree_frame.pack(fill="both", expand=True)
         tree_frame.columnconfigure(0, weight=1)
@@ -272,9 +313,58 @@ class DirectTranslatorApp:
         xbar = ttk.Scrollbar(tree_frame, orient="horizontal", command=self.input_tree.xview)
         xbar.grid(row=1, column=0, sticky="ew")
         self.input_tree.configure(yscrollcommand=ybar.set, xscrollcommand=xbar.set)
+        result_left, result_right = self._columns(self.pages[2], (2, 3))
+        result_scroll = carbon_theme.ScrollableFrame(result_left, colors=c)
+        result_scroll.pack(fill="both", expand=True)
+        result_left = result_scroll.content
+        status = self._card(result_left, "本次任务")
+        self.status_label = ttk.Label(status, textvariable=self.status_title, style="Status.TLabel")
+        self.status_label.pack(fill="x")
+        self._wrap(self.status_label, status, self._u(40))
+        detail = ttk.Label(status, textvariable=self.status_detail, style="CardCaption.TLabel", wraplength=320)
+        detail.pack(fill="x", pady=(7, 14))
+        self._wrap(detail, status)
+        metrics = ttk.Frame(status, style="Card.TFrame")
+        metrics.pack(fill="x")
+        self.metric_labels = []
+        for caption, variable in (("文本组", self.count_text), ("已用时间", self.elapsed_text)):
+            label = ttk.Label(metrics, text=caption, style="CardCaption.TLabel")
+            value = ttk.Label(metrics, textvariable=variable, style="Metric.TLabel")
+            self.metric_labels.append((label, value))
+        def arrange_metrics(event):
+            stacked = event.width < self._u(240)
+            metrics.columnconfigure(0, weight=1)
+            metrics.columnconfigure(1, weight=0 if stacked else 1)
+            for index, (label, value) in enumerate(self.metric_labels):
+                row, column = (index * 2, 0) if stacked else (0, index)
+                label.grid(row=row, column=column, sticky="w")
+                value.grid(row=row+1, column=column, sticky="w", pady=(3, 10))
+        metrics.bind("<Configure>", arrange_metrics)
+        # Give the container an initial requested size before its first resize.
+        for index, (label, value) in enumerate(self.metric_labels):
+            label.grid(row=0, column=index, sticky="w")
+            value.grid(row=1, column=index, sticky="w", pady=(3, 10))
+        self.progress = ttk.Progressbar(status, maximum=100, mode="determinate")
+        self.progress.pack(fill="x")
+        ttk.Label(status, textvariable=self.progress_text, style="CardCaption.TLabel").pack(anchor="w", pady=(7, 0))
+        self.result_card = self._card(result_left, "输出文件")
+        result_label = ttk.Label(self.result_card, textvariable=self.result_summary, style="CardCaption.TLabel", wraplength=320)
+        result_label.pack(fill="x", pady=(0, 10))
+        self._wrap(result_label, self.result_card)
+        row = ttk.Frame(self.result_card, style="Card.TFrame")
+        row.pack(fill="x")
+        self.result_button = ttk.Button(row, text="打开结果", style="Compact.TButton", command=lambda: self._open_path(self._output_path))
+        self.result_button.pack(fill="x", pady=(0, 8))
+        self.report_button = ttk.Button(row, text="查看报告", style="Compact.TButton", command=lambda: self._open_path(self._report_path))
+        self.report_button.pack(fill="x", pady=(0, 8))
+        ttk.Button(row, text="所在文件夹", style="Compact.TButton", command=self.open_output_dir).pack(fill="x")
+        self.result_card.pack_forget()
+        self.log_tab = ttk.Frame(result_right, style="Card.TFrame", padding=self._u(20))
+        self.log_tab.pack(fill="both", expand=True)
+        ttk.Label(self.log_tab, text="运行日志", style="Section.TLabel").pack(anchor="w", pady=(0, 10))
         row = ttk.Frame(self.log_tab, style="Card.TFrame")
         row.pack(fill="x", pady=(0, 6))
-        ttk.Label(row, text="详细过程与错误信息", style="CardCaption.TLabel").pack(side="left")
+        ttk.Label(row, text="处理明细", style="CardCaption.TLabel").pack(side="left")
         ttk.Button(row, text="复制", style="Compact.TButton", command=self._copy_log).pack(side="right")
         ttk.Button(row, text="清空", style="Compact.TButton", command=self._clear_log).pack(side="right", padx=6)
         log_body = ttk.Frame(self.log_tab, style="Card.TFrame")
@@ -286,14 +376,138 @@ class DirectTranslatorApp:
         self.log_text.pack(fill="both", expand=True)
         self.log_text.configure(yscrollcommand=bar.set)
 
+        self._show_step(0)
+
+    def _fit_footer(self, event=None):
+        fixed = self.run_button.winfo_reqwidth() + self.back_button.winfo_reqwidth() + self._u(64)
+        if self._step == 2:
+            fixed += self.stop_button.winfo_reqwidth() + self._u(8)
+        width = event.width if event is not None else self.footer_hint_label.master.winfo_width()
+        if width < fixed + self.footer_hint_label.winfo_reqwidth():
+            self.footer_hint_label.pack_forget()
+        else:
+            self.footer_hint_label.pack(side="left", padx=12, after=self.back_button)
+
+    def _refresh_navigation(self):
+        labels = ("模型服务", "翻译内容", "运行与结果")
+        descriptions = (
+            "已填写" if self._service_confirmed else "必填 · 先配置服务",
+            "选择 CSV 与术语表",
+            "查看进度与输出",
+        )
+        for index, button in enumerate(self.step_buttons):
+            button.configure(text=f"{index+1:02}  {labels[index]}\n      {descriptions[index]}",
+                             style="Active.Nav.TButton" if index == self._step else "Nav.TButton")
+            enabled = not self._running or index == 2
+            if index == 2 and self._active_config is None:
+                enabled = False
+            button.state(["!disabled"] if enabled else ["disabled"])
+            self.step_lines[index].configure(style="Accent.TFrame" if index == self._step else "Card.TFrame")
+        self.back_button.state(["disabled"] if self._step == 0 or self._running else ["!disabled"])
+        if self._step == 0:
+            self.run_button.configure(text="保存并继续  →", state="normal")
+            self.footer_hint.set("仅保存到本机")
+        elif self._step == 1:
+            self.run_button.configure(text="开始翻译  →", state="normal")
+            self.footer_hint.set("Ctrl+Enter  开始")
+        else:
+            label = {"running": "翻译中…", "pausing": "正在保存…", "paused": "继续翻译",
+                     "done": "再次处理", "error": "重试"}.get(self._state, "开始翻译")
+            self.run_button.configure(text=label, state="disabled" if self._running else "normal")
+            self.footer_hint.set("Ctrl+.  暂停" if self._running else "可以返回调整配置")
+        if self._step == 2:
+            self.stop_button.pack(side="right", padx=(0, self._u(8)), after=self.run_button)
+        else:
+            self.stop_button.pack_forget()
+        self._fit_footer()
+
+    def _show_step(self, step):
+        self._step = step
+        content = (
+            ("配置模型服务", "先填写模型服务，再准备翻译内容。已保存的配置会自动带入。"),
+            ("准备翻译内容", "选择输入文件，按需导入术语表，并在右侧核对数据。"),
+            ("运行与结果", "查看当前进度；暂停后可从已保存的位置继续。"),
+        )
+        self.step_kicker.set(f"步骤 {step+1:02} / 03")
+        self.page_title.set(content[step][0])
+        self.page_description.set(content[step][1])
+        for index, page in enumerate(self.pages):
+            if index == step:
+                page.place(x=0, y=0, relwidth=1, relheight=1)
+            else:
+                page.place_forget()
+        self._refresh_navigation()
+
+    def _go_step(self, step):
+        if self._running:
+            return
+        if step == 0:
+            self.form_feedback.set("")
+            self._show_step(0)
+        elif step == 1:
+            self._continue_from_service()
+        elif self._active_config is not None:
+            self.form_feedback.set("")
+            self._show_step(2)
+
+    def _service_changed(self, *_):
+        self._service_confirmed = False
+        self._refresh_navigation()
+
+    def _validate_service(self):
+        if not self.llm_api_key.get().strip():
+            self._show_form_error("请先填写 API Key，再继续。", self.api_key_entry, settings=True)
+            return None
+        invalid_field = self.endpoint_entry
+        try:
+            endpoint = validate_endpoint(self.llm_endpoint.get())
+            invalid_field = self.model_entry
+            if not self.llm_model.get().strip():
+                raise ValueError("请填写服务商提供的模型名称。")
+            invalid_field = self.threads_spinbox
+            threads = bounded_integer(self.llm_threads.get(), "并发请求数", 1, 16)
+            invalid_field = self.flush_spinbox
+            interval = bounded_integer(self.flush_interval.get(), "自动保存间隔", 1, 50)
+        except ValueError as exc:
+            if invalid_field in (self.threads_spinbox, self.flush_spinbox) and not self._advanced_open:
+                self._toggle_advanced()
+            self._show_form_error(str(exc), invalid_field, settings=True)
+            return None
+        return endpoint, threads, interval
+
+    def _continue_from_service(self):
+        if self._validate_service() is None:
+            return
+        self._service_confirmed = True
+        self.api_key_entry.configure(show="*")
+        self.api_visibility_button.configure(text="显示")
+        self.form_feedback.set("")
+        try:
+            self._save_settings()
+        except OSError:
+            self.form_feedback.set("设置暂时无法保存；仍可继续本次翻译。")
+        self._show_step(1)
+
+    def _primary_action(self):
+        if self._running:
+            return
+        if self._step == 0:
+            self._continue_from_service()
+        else:
+            self.run()
+
     def _build_task_form(self, parent):
-        card = self._card(parent, "01  选择翻译文件")
+        card = self._card(parent, "翻译文件")
+        self.file_card = card
+        ttk.Label(card, text="输入 CSV *", style="CardCaption.TLabel").pack(anchor="w", pady=(0, 5))
         row = ttk.Frame(card, style="Card.TFrame")
         row.pack(fill="x")
         self.input_entry = ttk.Entry(row, textvariable=self.input_path, width=18)
-        self.input_entry.pack(side="left", fill="x", expand=True, padx=(0, 6))
+        self.input_entry.pack(fill="x")
+        row = ttk.Frame(card, style="Card.TFrame")
+        row.pack(fill="x", pady=(8, 0))
         ttk.Button(row, text="选择 CSV", style="Compact.TButton", command=self.choose_input).pack(side="left")
-        self.recent_menu_btn = ttk.Menubutton(row, text="最近", style="Compact.TButton")
+        self.recent_menu_btn = ttk.Menubutton(row, text="最近", style="Compact.TMenubutton")
         self.recent_menu_btn.pack(side="left", padx=(6, 0))
         self.recent_menu = Menu(self.recent_menu_btn, tearoff=0)
         self.recent_menu_btn.configure(menu=self.recent_menu)
@@ -305,24 +519,27 @@ class DirectTranslatorApp:
         row = ttk.Frame(card, style="Card.TFrame")
         row.pack(fill="x")
         self.output_entry = ttk.Entry(row, textvariable=self.output_dir, width=18)
-        self.output_entry.pack(side="left", fill="x", expand=True, padx=(0, 6))
-        ttk.Button(row, text="更改", style="Compact.TButton", command=self.choose_output_dir).pack(side="left")
-        card = self._card(parent, "02  自定义术语表", "使用你的固定译名，保持不同文本中的术语一致。")
+        row.columnconfigure(0, weight=1)
+        self.output_entry.grid(row=0, column=0, sticky="ew", padx=(0, 6))
+        ttk.Button(row, text="更改", style="Compact.TButton", command=self.choose_output_dir).grid(row=0, column=1, sticky="ns")
+        card = self._card(parent, "自定义术语表 · 可选", "使用你的固定译名，保持不同文本中的术语一致。")
         label = ttk.Label(card, textvariable=self.glossary_summary, style="Card.TLabel", wraplength=400)
         label.pack(fill="x", pady=(0, 10))
         self._wrap(label, card)
         row = ttk.Frame(card, style="Card.TFrame")
         row.pack(fill="x")
         self.glossary_import_button = ttk.Button(row, text="导入术语表", style="Compact.TButton", command=self.choose_glossary)
-        self.glossary_import_button.pack(side="left", padx=(0, 6))
+        self.glossary_import_button.pack(fill="x")
+        row = ttk.Frame(card, style="Card.TFrame")
+        row.pack(fill="x", pady=(8, 0))
         self.glossary_mapping_button = ttk.Button(row, text="修改列映射", style="Compact.TButton", command=self.edit_glossary_mapping, state="disabled")
         self.glossary_mapping_button.pack(side="left", padx=(0, 6))
         self.glossary_clear_button = ttk.Button(row, text="移除", style="Compact.TButton", command=self.clear_glossary, state="disabled")
         self.glossary_clear_button.pack(side="left")
         ttk.Button(card, text="导出空白模板", style="Text.TButton", command=self.export_glossary_template).pack(anchor="w", pady=(7, 0))
-        card = self._card(parent, "03  翻译偏好", "默认只填写空白译文，并跳过标记为不翻译的行。")
-        for label, variable in (("覆盖已有译文", self.overwrite), ("忽略不翻译标记，处理所有行", self.force_translate_all),
-                                ("完成后检查标签与译文一致性", self.run_stage3)):
+        card = self._card(parent, "翻译偏好", "默认只填写空白译文，并跳过标记为不翻译的行。")
+        for label, variable in (("覆盖已有译文", self.overwrite), ("处理标记为不翻译的行", self.force_translate_all),
+                                ("完成后检查格式与一致性", self.run_stage3)):
             ttk.Checkbutton(card, text=label, variable=variable, style="G.TCheckbutton").pack(anchor="w", pady=3)
         ttk.Label(card, text="额外要求（可选）", style="CardCaption.TLabel").pack(anchor="w", pady=(12, 6))
         c = self.m3_colors
@@ -331,23 +548,27 @@ class DirectTranslatorApp:
                                       highlightcolor=c["primary"], font=("Microsoft YaHei UI", 10), padx=8, pady=8)
         self.extra_prompt_text.pack(fill="x")
         self.extra_prompt_text.insert("1.0", self.extra_prompt.get())
-        ttk.Label(card, text="例如：保持口语化；统一女性代词；不要扩写。", style="CardCaption.TLabel").pack(anchor="w", pady=(6, 0))
+        hint = ttk.Label(card, text="例如：保持口语化；统一女性代词；不要扩写。", style="CardCaption.TLabel")
+        hint.pack(fill="x", pady=(6, 0))
+        self._wrap(hint, card, self._u(40))
 
     def _build_settings(self, parent):
-        card = self._card(parent, "连接翻译模型", "设置会保存在本机；支持兼容 Chat Completions 的接口。")
-        for title, variable, name in (("服务地址（Endpoint）", self.llm_endpoint, "endpoint_entry"),
-                                      ("模型名称（Model）", self.llm_model, "model_entry")):
+        card = self._card(parent, "服务配置", "* 为必填项 · 支持兼容 Chat Completions 的接口。")
+        self.service_card = card
+        for title, variable, name in (("服务地址 *", self.llm_endpoint, "endpoint_entry"),
+                                      ("模型名称 *", self.llm_model, "model_entry")):
             ttk.Label(card, text=title, style="CardCaption.TLabel").pack(anchor="w", pady=(0, 5))
             entry = ttk.Entry(card, textvariable=variable, width=20)
             entry.pack(fill="x", pady=(0, 14))
             setattr(self, name, entry)
-        ttk.Label(card, text="API Key", style="CardCaption.TLabel").pack(anchor="w", pady=(0, 5))
+        ttk.Label(card, text="API Key *", style="CardCaption.TLabel").pack(anchor="w", pady=(0, 5))
         row = ttk.Frame(card, style="Card.TFrame")
         row.pack(fill="x")
         self.api_key_entry = ttk.Entry(row, textvariable=self.llm_api_key, show="*", width=16)
-        self.api_key_entry.pack(side="left", fill="x", expand=True, padx=(0, 6))
+        row.columnconfigure(0, weight=1)
+        self.api_key_entry.grid(row=0, column=0, sticky="ew", padx=(0, 6))
         self.api_visibility_button = ttk.Button(row, text="显示", style="Compact.TButton", command=self._toggle_api_key)
-        self.api_visibility_button.pack(side="left")
+        self.api_visibility_button.grid(row=0, column=1, sticky="ns")
         label = ttk.Label(card, text="源文及匹配术语会发送到上述接口。API Key 保存在本机 settings.json 中。",
                           style="CardCaption.TLabel", wraplength=400)
         label.pack(fill="x", pady=(12, 0))
@@ -396,8 +617,8 @@ class DirectTranslatorApp:
         self.input_path.set(str(path))
         self._recent_files = ([str(path)] + [p for p in self._recent_files if p != str(path)])[:MAX_RECENT_FILES]
         self._update_recent_menu()
-        self.workspace_tabs.select(self.task_panel)
-        self.detail_tabs.select(self.preview_tab)
+        if self._service_confirmed:
+            self._show_step(1)
 
     def choose_input(self):
         if not self._running:
@@ -517,7 +738,7 @@ class DirectTranslatorApp:
     def _show_form_error(self, text, widget=None, settings=False):
         self.form_feedback.set(text)
         self.feedback_label.configure(foreground=self.m3_colors["error"])
-        self.workspace_tabs.select(self.settings_panel if settings else self.task_panel)
+        self._show_step(0 if settings else 1)
         if widget:
             panel = self.settings_panel if settings else self.task_panel
             self.root.update_idletasks()
@@ -555,6 +776,11 @@ class DirectTranslatorApp:
         if self._running:
             return
         self.form_feedback.set("")
+        service = self._validate_service()
+        if service is None:
+            return
+        endpoint, threads, interval = service
+        self._service_confirmed = True
         try:
             input_path = Path(self.input_path.get().strip()).expanduser()
             preview = inspect_input(input_path, self.force_translate_all.get(), self.overwrite.get())
@@ -566,24 +792,8 @@ class DirectTranslatorApp:
             self.status_title.set("没有待处理文本")
             self.status_detail.set("目标单元格已有译文，或行被标记为不翻译。可调整翻译偏好后重试。")
             self.progress_text.set("未发起翻译请求")
-            return
-        if not self.llm_api_key.get().strip():
-            self._show_form_error("请填写 API Key 后开始翻译。", self.api_key_entry, settings=True)
-            return
-        invalid_field = self.endpoint_entry
-        try:
-            endpoint = validate_endpoint(self.llm_endpoint.get())
-            invalid_field = self.model_entry
-            if not self.llm_model.get().strip():
-                raise ValueError("请填写服务商提供的模型名称。")
-            invalid_field = self.threads_spinbox
-            threads = bounded_integer(self.llm_threads.get(), "并发请求数", 1, 16)
-            invalid_field = self.flush_spinbox
-            interval = bounded_integer(self.flush_interval.get(), "自动保存间隔", 1, 50)
-        except ValueError as exc:
-            if "整数" in str(exc) and not self._advanced_open:
-                self._toggle_advanced()
-            self._show_form_error(str(exc), invalid_field, settings=True)
+            self.form_feedback.set("没有待处理文本：译文已填满，或行被标记为不翻译。")
+            self._show_step(1)
             return
         self._sync_extra_prompt()
         try:
@@ -636,7 +846,7 @@ class DirectTranslatorApp:
         self.run_button.configure(text="翻译中…", state="disabled")
         self.stop_button.configure(text="暂停", state="normal")
         self._append_log("开始本次任务。")
-        self.workspace_tabs.select(self.task_panel)
+        self._show_step(2)
         threading.Thread(target=self._run_worker, args=(config, self.run_stage3.get()), daemon=True).start()
 
     def stop(self):
@@ -648,6 +858,7 @@ class DirectTranslatorApp:
         self.status_title.set("正在暂停")
         self.status_detail.set("不再发起新请求；等待正在处理的译文返回并保存后，即可继续。")
         self._append_log("已请求暂停，将保存正在完成的译文。")
+        self._refresh_navigation()
 
     def _run_worker(self, config, stage3_enabled):
         try:
@@ -708,7 +919,7 @@ class DirectTranslatorApp:
         has_output = self._output_path is not None and self._output_path.is_file()
         has_report = self._report_path is not None and self._report_path.is_file()
         if has_output or has_report:
-            self.result_card.pack(before=self.detail_tabs, fill="x", pady=(0, 12))
+            self.result_card.pack(fill="x", pady=(0, 12))
         self.result_button.state(["!disabled"] if has_output else ["disabled"])
         self.report_button.state(["!disabled"] if has_report else ["disabled"])
 
@@ -790,8 +1001,9 @@ class DirectTranslatorApp:
             self.run_button.configure(text="重试", state="normal")
             self.result_summary.set("输出目录中的文件（本次未完成）")
             self._append_log(str(payload))
-            self.detail_tabs.select(self.log_tab)
+            self._show_step(2)
         self._show_results()
+        self._refresh_navigation()
         if self._close_requested:
             self._finish_close()
 
@@ -828,13 +1040,13 @@ class DirectTranslatorApp:
 
     def show_help(self):
         messagebox.showinfo("使用说明",
-            "1. 选择多语言文本管理导出的 UTF-8 CSV，在右侧检查预览。\n"
-            "2. 可选导入自己的 CSV / TSV 术语表，在映射窗口选择语言列。\n"
-            "3. 在「模型设置」填写服务地址、模型名称和 API Key。\n"
-            "4. 点击「开始翻译」；完成后可直接打开结果和报告。\n\n"
+            "1. 在「模型服务」填写 API Key，确认地址和模型后「保存并继续」。\n"
+            "2. 在「翻译内容」选择多语言文本管理导出的 UTF-8 CSV。\n"
+            "   可选导入自己的 CSV / TSV 术语表，确认语言列并检查文件预览。\n"
+            "3. 点击「开始翻译」，在「运行与结果」查看进度、日志和输出。\n\n"
             "默认只填空白译文，并跳过不翻译的行。暂停会等待当前请求返回并保存。\n"
             "术语、输入或配置变化后会重新开始处理。项目不附带原神术语表。\n\n"
-            "快捷键：Ctrl+O 选择文件；Ctrl+Enter 开始 / 继续；Ctrl+. 暂停。\n"
+            "快捷键：Ctrl+O 选择文件；Ctrl+Enter 下一步 / 开始 / 继续；Ctrl+. 暂停。\n"
             "完整提示词与格式说明见 README.md。", parent=self.root)
 
     def mainloop(self):

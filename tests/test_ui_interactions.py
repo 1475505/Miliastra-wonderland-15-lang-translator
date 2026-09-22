@@ -8,7 +8,7 @@ from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path[:0] = [str(ROOT / "app"), str(ROOT / "tools")]
-from ui_helpers import inspect_input, bounded_integer, validate_endpoint, duration_label
+from ui_helpers import inspect_input, bounded_integer, validate_endpoint, duration_label, initial_model
 from translate_from_terms import write_csv, read_input
 from llm_stage2 import Stage2Config, Stage2Paused, run_stage2
 
@@ -47,6 +47,19 @@ class InputChecks(unittest.TestCase):
                 validate_endpoint(value)
         self.assertEqual(validate_endpoint(" https://example.com/v1/chat/completions "), "https://example.com/v1/chat/completions")
         self.assertEqual(duration_label(3661), "01:01:01")
+
+    def test_default_model_migration_is_limited_to_official_old_default(self):
+        from llm_stage2 import DEFAULT_MODEL
+        self.assertEqual(DEFAULT_MODEL, "deepseek-flash")
+        self.assertEqual(initial_model({}), "deepseek-flash")
+        self.assertEqual(initial_model({"llm_model": "deepseek-v4-flash"}), "deepseek-flash")
+        self.assertEqual(initial_model({"llm_model": "deepseek-v4-flash",
+            "llm_endpoint": "https://api.deepseek.com/v1/chat/completions"}), "deepseek-flash")
+        self.assertEqual(initial_model({"llm_model": "my-model"}), "my-model")
+        self.assertEqual(initial_model({"llm_model": "deepseek-v4-flash",
+            "llm_endpoint": "https://custom.example/chat/completions"}), "deepseek-v4-flash")
+        self.assertEqual(initial_model({"llm_model": "deepseek-v4-flash",
+            "llm_endpoint": "https://api.deepseek.com.example/chat/completions"}), "deepseek-v4-flash")
 
 
 class PauseChecks(unittest.TestCase):
@@ -159,9 +172,58 @@ class DesktopInteractions(unittest.TestCase):
         with patch.object(self.gui.messagebox, "showerror") as modal:
             self.app.run()
         modal.assert_not_called()
-        self.assertEqual(self.app.workspace_tabs.select(), str(self.app.settings_panel))
+        self.assertEqual(self.app._step, 0)
         self.assertIn("API Key", self.app.form_feedback.get())
         self.assertFalse(self.app._running)
+
+    def test_first_step_guides_service_before_file(self):
+        self.assertEqual(self.app._step, 0)
+        self.assertEqual(self.app.run_button["text"], "保存并继续  →")
+        self.assertTrue(self.app.step_buttons[2].instate(["disabled"]))
+        self.app.llm_api_key.set("")
+        self.app.input_path.set("")
+        with patch.object(self.gui.threading, "Thread") as worker:
+            self.app._primary_action()
+            self.app.run()  # Also protect direct/shortcut calls.
+        worker.assert_not_called()
+        self.assertEqual(self.app._step, 0)
+        self.assertIn("API Key", self.app.form_feedback.get())
+
+    def test_next_saves_service_without_request_then_back_preserves_input(self):
+        with patch.object(self.gui.threading, "Thread") as worker:
+            self.app._primary_action()
+        worker.assert_not_called()
+        self.assertEqual(self.app._step, 1)
+        self.assertTrue(self.app._service_confirmed)
+        self.assertTrue((self.folder / "settings.json").is_file())
+        self.app._go_step(0)
+        self.assertEqual(self.app.input_path.get(), str(self.input))
+        self.app.llm_endpoint.set("bad endpoint")
+        self.assertFalse(self.app._service_confirmed)
+        self.app._go_step(1)
+        self.assertEqual(self.app._step, 0)
+        self.assertIn("接口地址", self.app.form_feedback.get())
+
+    def test_running_stays_on_results_and_blocks_navigation(self):
+        self.start_mocked()
+        self.assertEqual(self.app._step, 2)
+        self.app._go_step(0)
+        self.assertEqual(self.app._step, 2)
+        self.assertTrue(self.app.step_buttons[0].instate(["disabled"]))
+        self.app._handle_message("paused", None)
+        self.app._go_step(0)
+        self.assertEqual(self.app._step, 0)
+        self.assertTrue(self.app.step_buttons[0].instate(["!disabled"]))
+
+    def test_service_and_preview_cards_align_on_grid(self):
+        self.app.root.deiconify()
+        self.app.root.update()
+        self.assertEqual(self.app.service_card.winfo_rooty(), self.app.service_guide.winfo_rooty())
+        self.app._show_step(1)
+        self.app.root.update()
+        self.assertEqual(self.app.file_card.winfo_rooty(), self.app.preview_tab.winfo_rooty())
+        self.assertGreater(self.app.input_entry.winfo_width(), 80)
+        self.app.root.withdraw()
 
     def test_invalid_integer_does_not_start_worker(self):
         self.app.llm_threads.set("bad")
@@ -241,6 +303,17 @@ class DesktopInteractions(unittest.TestCase):
         self.app.root.geometry("960x680+20+20")
         self.app.root.deiconify()
         self.app.root.update()
+        for step in range(3):
+            self.app._show_step(step)
+            self.app.root.update_idletasks()
+            self.assertGreater(self.app.pages[step].winfo_height(), 200)
+            def assert_controls_fit(parent):
+                for child in parent.winfo_children():
+                    if child.winfo_ismapped() and child.winfo_class() in ("TButton", "TMenubutton"):
+                        self.assertGreaterEqual(child.winfo_width(), child.winfo_reqwidth(),
+                                                child.cget("text"))
+                    assert_controls_fit(child)
+            assert_controls_fit(self.app.root)
         for widget in (self.app.run_button, self.app.stop_button):
             self.assertTrue(widget.winfo_ismapped())
             self.assertLessEqual(widget.winfo_rooty()+widget.winfo_height(),

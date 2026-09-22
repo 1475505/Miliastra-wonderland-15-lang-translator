@@ -3,7 +3,7 @@
 from pathlib import Path
 from urllib.parse import urlparse
 
-from llm_stage2 import build_tasks
+from llm_stage2 import DEFAULT_ENDPOINT, DEFAULT_MODEL, build_tasks
 from translate_from_terms import SOURCE_COLUMN, NEED_TRANSLATE_COLUMN, read_input, target_columns
 
 
@@ -52,3 +52,16 @@ def duration_label(seconds):
     hours, remainder = divmod(seconds, 3600)
     minutes, seconds = divmod(remainder, 60)
     return f"{hours:02}:{minutes:02}:{seconds:02}" if hours else f"{minutes:02}:{seconds:02}"
+
+
+def initial_model(settings):
+    """Migrate only this app's former default at the official DeepSeek host."""
+    endpoint = str(settings.get("llm_endpoint", DEFAULT_ENDPOINT))
+    model = str(settings.get("llm_model", DEFAULT_MODEL)).strip()
+    try:
+        official = urlparse(endpoint.strip()).hostname == "api.deepseek.com"
+    except ValueError:
+        official = False
+    if official and model == "deepseek-v4-flash":
+        return DEFAULT_MODEL
+    return model

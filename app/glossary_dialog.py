@@ -3,7 +3,7 @@
 from pathlib import Path
 from tkinter import StringVar, Toplevel, ttk
 
-import m3_theme
+import carbon_theme
 from custom_glossary import read_glossary, read_glossary_headers
 from translate_from_terms import FRIENDLY_TO_TERM
 
@@ -35,7 +35,7 @@ class GlossaryDialog:
         self.confirm_button.pack(side="right")
         ttk.Button(buttons, text="取消", style="Text.TButton", command=self.close).pack(side="right", padx=10)
         ttk.Button(buttons, text="自动识别列名", style="Text.TButton", command=self.auto_map).pack(side="left")
-        scroll = m3_theme.ScrollableFrame(outer)
+        scroll = carbon_theme.ScrollableFrame(outer, colors={"background": "#f4f4f4"})
         scroll.pack(fill="both", expand=True)
         body = scroll.content
         heading = ttk.Label(body, text=path.name, style="Headline.TLabel", wraplength=650)
@@ -99,7 +99,7 @@ class GlossaryDialog:
             codes, rows = read_glossary(self.path, mapping)
         except (OSError, ValueError) as exc:
             self.status.set(str(exc))
-            self.status_label.configure(foreground="#BA1A1A")
+            self.status_label.configure(foreground="#da1e28")
             self.confirm_button.state(["disabled"])
             return
         names = {value: key for key, value in FRIENDLY_TO_TERM.items()}
@@ -110,7 +110,7 @@ class GlossaryDialog:
         for row in rows[:5]:
             self.preview_tree.insert("", "end", values=[value[:150].replace("\n", " ↵ ") for value in row])
         self.status.set(f"可以导入 · {len(rows)} 条术语 · {len(codes)-1} 种目标语言")
-        self.status_label.configure(foreground="#1E4620")
+        self.status_label.configure(foreground="#198038")
         self.confirm_button.state(["!disabled"])
 
     def auto_map(self):
@@ -123,7 +123,7 @@ class GlossaryDialog:
             _, rows = read_glossary(path, mapping)
         except (OSError, ValueError) as exc:
             self.status.set(str(exc))
-            self.status_label.configure(foreground="#BA1A1A")
+            self.status_label.configure(foreground="#da1e28")
             self.confirm_button.state(["disabled"])
             return
         self.result = mapping, len(rows)

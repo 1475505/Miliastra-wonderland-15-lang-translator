@@ -39,7 +39,7 @@ from custom_glossary import load_column_mapping
 from prompts import SYSTEM_PROMPT, PIVOT_SYSTEM_PROMPT, EXTRA_PROMPT_PREFIX, USER_PROMPT_PREFIX
 
 DEFAULT_ENDPOINT = "https://api.deepseek.com/chat/completions"
-DEFAULT_MODEL = "deepseek-v4-flash"
+DEFAULT_MODEL = "deepseek-flash"
 
 TERM_TO_INPUT_LANG = {value: key for key, value in INPUT_TO_TERM_LANG.items()}
 TERM_LANG_ORDER = ["CHT", "EN", "KR", "JP", "ES", "FR", "RU", "TH", "VI", "DE", "ID", "PT", "TR", "IT"]
