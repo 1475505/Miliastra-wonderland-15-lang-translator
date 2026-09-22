@@ -5,10 +5,14 @@ on:
     branches: [master]
     paths:
       - 'docs/releases/*.md'
+      - '.github/workflows/windows-release.yml'
   workflow_dispatch:
 
 permissions:
   contents: read
+
+env:
+  PYTHONUTF8: '1'
 
 concurrency:
   group: windows-release
@@ -48,7 +52,6 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
-          PYTHONUTF8: '1'
         run: |
           $releaseVersion = python tools/package_release.py --version
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
