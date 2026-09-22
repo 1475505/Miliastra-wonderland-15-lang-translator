@@ -81,12 +81,12 @@ def parse_args() -> argparse.Namespace:
         description="Translate input.csv columns from the custom term table."
     )
     parser.add_argument(
-        "--input", default=str(resource_path("data/samples/input.csv")), help="Input CSV path."
+        "--input", required=True, help="Input CSV path."
     )
     parser.add_argument(
         "--terms",
         default="",
-        help="Term table path(s). Comma-separated for multiple sources. Leave empty to use --custom-terms only.",
+        help="User-supplied term table CSV/TSV path. No bundled glossary is loaded.",
     )
     parser.add_argument(
         "--output", default="outputs/output_15lang.csv", help="Output CSV path."
@@ -125,7 +125,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--custom-terms",
         default="",
-        help="Optional custom term table (friendly CSV or code TSV) merged with the built-in table.",
+        help="Optional additional user-supplied term table CSV/TSV path.",
     )
     return parser.parse_args()
 
@@ -140,7 +140,7 @@ def read_input(path: Path) -> tuple[list[str], list[dict[str, str]]]:
         rows: list[dict[str, str]] = []
         for row in reader:
             # Keep only fields that are in our cleaned fieldnames
-            cleaned_row = {k: v for k, v in row.items() if k is not None and k in fieldnames}
+            cleaned_row = {k: (v or "") for k, v in row.items() if k is not None and k in fieldnames}
             rows.append(cleaned_row)
         return fieldnames, rows
 
@@ -172,43 +172,15 @@ def row_translations(term_headers: list[str], row: list[str]) -> dict[str, str]:
     return {header: row[i] if i < len(row) else "" for i, header in enumerate(term_headers)}
 
 
-def read_term_rows(path):
-    """Yield (headers_in_term_codes, values) for a term source.
+def read_term_rows(path, column_mapping=None, delimiter="auto"):
+    """Read only explicitly supplied CSV/TSV files using names, codes or mappings."""
+    from custom_glossary import read_glossary
 
-    Accepts a single Path, or a list/tuple of Paths. Each file is auto-detected:
-    the built-in table is TSV using term codes (CHS/CHT/EN...); custom term
-    files use friendly language names (简体中文/繁体中文/英语...) as column
-    headers and are converted to term codes on the fly so callers stay uniform.
-    """
-    if isinstance(path, (list, tuple)):
-        for sub in path:
-            yield from _read_single_term_file(Path(sub))
-    else:
-        yield from _read_single_term_file(Path(path))
-
-
-def _read_single_term_file(path: Path):
-    with path.open("r", encoding="utf-8-sig", newline="") as f:
-        first_line = f.readline()
-        f.seek(0)
-        if "\t" in first_line and "CHS" in first_line:
-            reader = csv.reader(f, dialect="excel-tab")
-            headers = next(reader, None)
-            if headers is None:
-                return
-            for row in reader:
-                if not row:
-                    continue
-                yield headers, row
-        else:
-            reader = csv.DictReader(f)
-            headers = reader.fieldnames or []
-            code_headers = [FRIENDLY_TO_TERM.get(h.strip(), h.strip()) for h in headers]
-            for row in reader:
-                values = [row.get(h, "") or "" for h in headers]
-                if not any(v.strip() for v in values):
-                    continue
-                yield code_headers, values
+    paths = path if isinstance(path, (list, tuple)) else [path]
+    for item in paths:
+        headers, rows = read_glossary(Path(item), column_mapping, delimiter)
+        for row in rows:
+            yield headers, row
 
 
 def exact_matches(term_path: Path, sources: set[str]) -> dict[str, Match]:
@@ -404,30 +376,10 @@ def read_custom_terms(path: Path) -> list[dict[str, str]]:
     """Read a custom term file into rows keyed by friendly column names."""
     if not path.is_file():
         return []
-    rows: list[dict[str, str]] = []
-    with path.open("r", encoding="utf-8-sig", newline="") as f:
-        first_line = f.readline()
-        f.seek(0)
-        if "\t" in first_line and "CHS" in first_line:
-            reader = csv.reader(f, dialect="excel-tab")
-            headers = next(reader, None)
-            if headers is None:
-                return rows
-            term_to_friendly = TERM_TO_INPUT_LANG
-            for row in reader:
-                if not row or not any(cell.strip() for cell in row):
-                    continue
-                values = {headers[i]: (row[i] if i < len(row) else "") for i in range(len(headers))}
-                friendly = {SOURCE_COLUMN: values.get("CHS", "")}
-                for term_code, friendly_name in term_to_friendly.items():
-                    friendly[friendly_name] = values.get(term_code, "")
-                rows.append(friendly)
-        else:
-            reader = csv.DictReader(f)
-            for row in reader:
-                item = {col: (row.get(col, "") or "") for col in FRIENDLY_TERM_COLUMNS}
-                if any(v.strip() for v in item.values()):
-                    rows.append(item)
+    rows = []
+    for headers, row in read_term_rows(path):
+        values = dict(zip(headers, row))
+        rows.append({name: values.get(code, "") for name, code in FRIENDLY_TO_TERM.items()})
     return rows
 
 
@@ -499,7 +451,7 @@ def _force_translate(rows: list[dict[str, str]]) -> None:
 
 def run_translation(
     input_path: Path,
-    term_path: Path,
+    term_path: Path | None,
     output_path: Path,
     remaining_path: Path,
     report_path: Path,
@@ -585,7 +537,7 @@ def main() -> None:
     args = parse_args()
     stats = run_translation(
         input_path=Path(args.input),
-        term_path=Path(args.terms),
+        term_path=Path(args.terms) if args.terms else None,
         output_path=Path(args.output),
         remaining_path=Path(args.remaining),
         report_path=Path(args.report),

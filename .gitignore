@@ -10,11 +10,19 @@ dist/
 outputs/
 release/
 
-# Term-table data (not used in this no-term-table version)
+# Private/local glossaries. Only synthetic examples belong in examples/.
 data/
-TermTable_15Lang.csv
+TermTable_15Lang.*
+glossaries/
+custom_terms*.csv
+custom_terms*.tsv
 
-# Other edition (full translator with term table) — not part of this repo
+# Local preferences may contain API keys and private glossary paths
+settings.json
+.env
+.env.*
+
+# Legacy local edition — not part of this repo
 app/qxqy_translator_gui.py
 qxqy_translator.spec
 QXQY_15Lang_Translator.spec

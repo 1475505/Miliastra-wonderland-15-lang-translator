@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import csv
 import heapq
+import hashlib
 import json
 import os
 import re
@@ -15,8 +16,8 @@ import unicodedata
 import urllib.error
 import urllib.request
 import uuid
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass
+from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
+from dataclasses import dataclass, field
 from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Callable, Iterable
@@ -34,6 +35,9 @@ from translate_from_terms import (
     write_csv,
 )
 
+from custom_glossary import load_column_mapping
+from prompts import SYSTEM_PROMPT, PIVOT_SYSTEM_PROMPT, EXTRA_PROMPT_PREFIX, USER_PROMPT_PREFIX
+
 DEFAULT_ENDPOINT = "https://api.deepseek.com/chat/completions"
 DEFAULT_MODEL = "deepseek-v4-flash"
 
@@ -45,7 +49,7 @@ CHINESE_RE = re.compile(r"[\u3400-\u9fff]")
 @dataclass
 class Stage2Config:
     input_path: Path
-    term_path: Path
+    term_path: Path | None
     output_path: Path
     report_path: Path
     endpoint: str = DEFAULT_ENDPOINT
@@ -65,7 +69,9 @@ class Stage2Config:
     stage1_matched_terms: dict[str, dict[str, str]] | None = None
     pivot_language: str = ""
     only_columns: list[str] | None = None
-    extra_prompt: str = ""
+    term_columns: dict[str, str] | None = None
+    term_delimiter: str = "auto"
+    checkpoint_key: str = field(init=False, default="", repr=False)
     # Number of nearest term references to inject per source in the fuzzy
     # fallback pass. Sources that already have references (exact/contains
     # matches) get the top K; sources with no references get max(3, K) as a
@@ -234,6 +240,8 @@ def collect_term_references(
     progress_callback: Callable[[str, int | None, int | None], None] | None = None,
     stage1_matched_terms: dict[str, dict[str, str]] | None = None,
     nearest_top_k: int = 1,
+    column_mapping: dict[str, str] | None = None,
+    delimiter: str = "auto",
 ) -> None:
     if not tasks:
         return
@@ -260,7 +268,7 @@ def collect_term_references(
     # Read the term table once and reuse the parsed rows across all passes to
     # avoid re-reading and re-parsing the same file three (plus one for the
     # row-count estimate) times.
-    term_rows = list(read_term_rows(term_path))
+    term_rows = list(read_term_rows(term_path, column_mapping, delimiter))
 
     # Pass 1: exact match short-circuits a source. Also collect source-in-term
     # candidates, which are usually useful for shortened UI text.
@@ -464,39 +472,14 @@ def make_prompt(task: Stage2Task, config: Stage2Config) -> list[dict[str, str]]:
         "protected_tokens": task.protected_tokens,
         "term_references": task.references[:9],
     }
-    if task.pivot_original:
-        system = (
-            f"你是游戏本地化译者。当前采用「基准语言」模式：先已将中文译成{pivot_label}，"
-            f"现在以{pivot_label}为源文翻译其余语言，original_chinese 是原始中文，"
-            "仅供理解上下文与术语对齐。"
-            "输出严格 JSON。遵守规则：\n"
-            "1. 同一中文必须同译；\n"
-            "2. <...>、{...}、\\n、数字变量和格式标签必须原样保留且顺序不变；\n"
-            "3. 术语表参考中的官方译名应优先采用；\n"
-            "4. 非文本、代码、标签、占位符、数字、纯符号应原样复制到各语言。"
-        )
-    else:
-        system = (
-            "你是游戏本地化译者。请基于给定中文、缺失语言和术语表参考，输出严格 JSON。"
-            "遵守规则：\n"
-            "1. 同一中文必须同译；\n"
-            "2. <...>、{...}、\\n、数字变量和格式标签必须原样保留且顺序不变。"
-            "  例如："
-            "  中文「<color=red>攻击力</color>」→ 英语必须包含「<color=red>」和「</color>」且内容完全不变；"
-            "  中文「{player_name}的等级」→ 各语言必须保留「{player_name}」；"
-            "  中文「等级\\n{0}」→ 必须保留换行符「\\n」和占位符「{0}」；\n"
-            "3. 术语表完全对应时可直接采用，部分匹配只能截取或改写，最近匹配只作参考；\n"
-            "4. 非中文、代码、标签、占位符、数字、纯符号应原样复制到各语言。"
-        )
+    system = (
+        PIVOT_SYSTEM_PROMPT.replace("{pivot_language}", pivot_label)
+        if task.pivot_original else SYSTEM_PROMPT
+    )
     extra = (config.extra_prompt or "").strip()
     if extra:
-        system = system + "\n\n附加要求（请严格遵守）：\n" + extra
-    user = (
-        "请逐项分析并翻译。只返回 JSON，不要 Markdown。格式："
-        '{"decision":"term_exact|term_partial|term_reference|ai_translation|copy_as_is|manual_review",'
-        '"translations":{"英语":"..."},"notes":"简短说明","needs_manual_review":false}\n\n'
-        f"任务数据：{json.dumps(payload, ensure_ascii=False)}"
-    )
+        system += EXTRA_PROMPT_PREFIX + extra
+    user = USER_PROMPT_PREFIX + json.dumps(payload, ensure_ascii=False)
     return [{"role": "system", "content": system}, {"role": "user", "content": user}]
 
 
@@ -567,6 +550,11 @@ def normalize_llm_result(result: dict[str, object], task: Stage2Task) -> dict[st
     notes = str(result.get("notes", "")).strip()
     needs_review = bool(result.get("needs_manual_review", False))
 
+    missing = [column for column in task.missing_columns if not normalized.get(column)]
+    if missing:
+        needs_review = True
+        notes = append_note(notes, "缺少目标语言：" + "、".join(missing))
+
     for token in task.protected_tokens:
         if token == "\\n":
             continue
@@ -591,25 +579,25 @@ def _checkpoint_path(output_path: Path) -> Path:
     return output_path.with_name(f".{output_path.stem}_checkpoint.json")
 
 
-def load_checkpoint(output_path: Path) -> set[str]:
+def load_checkpoint(output_path: Path, signature: str = "") -> set[str]:
     cp = _checkpoint_path(output_path)
     if not cp.is_file():
         return set()
     try:
         with cp.open("r", encoding="utf-8") as f:
             data = json.load(f)
-        if isinstance(data, dict) and isinstance(data.get("done"), list):
+        if isinstance(data, dict) and data.get("signature", "") == signature and isinstance(data.get("done"), list):
             return set(data["done"])
     except Exception:
         pass
     return set()
 
 
-def save_checkpoint(output_path: Path, done: set[str]) -> None:
+def save_checkpoint(output_path: Path, done: set[str], signature: str = "") -> None:
     cp = _checkpoint_path(output_path)
     cp.parent.mkdir(parents=True, exist_ok=True)
     with cp.open("w", encoding="utf-8") as f:
-        json.dump({"done": sorted(done)}, f, ensure_ascii=False, indent=2)
+        json.dump({"signature": signature, "done": sorted(done)}, f, ensure_ascii=False, indent=2)
 
 
 def _read_existing_output(path: Path) -> tuple[list[str], list[dict[str, str]]] | None:
@@ -665,7 +653,8 @@ def apply_results_for_source(
     if not isinstance(translations, dict):
         return 0
     match_value = (task.pivot_original if match_by_original and task.pivot_original else task.source).strip()
-    for row in rows:
+    for row_index in task.rows:
+        row = rows[row_index - 2]
         if row.get(SOURCE_COLUMN, "").strip() != match_value:
             continue
         for column in task.missing_columns:
@@ -701,91 +690,115 @@ def _run_llm_round(
     if not tasks:
         return results, filled
 
-    lock = threading.Lock()
-    completed = 0
     total_tasks = len(tasks)
     pending = [(task.source, task) for task in tasks.values() if task.source not in checkpoint_done]
+    completed = total_tasks - len(pending)
     progress_callback = config.progress_callback
     if progress_callback:
         progress_callback(
             f"{stage_label}：本轮 {total_tasks} 组，待执行 {len(pending)} 组。",
-            0,
-            total_tasks,
+            completed, total_tasks,
         )
 
-    def _flush() -> None:
+    def _flush():
         write_csv(config.output_path, fieldnames, rows)
-        save_checkpoint(config.output_path, checkpoint_done)
+        save_checkpoint(config.output_path, checkpoint_done, config.checkpoint_key)
+        write_stage2_report(config.report_path, tasks, results)
 
+    def stopping():
+        return config.stop_event is not None and config.stop_event.is_set()
+
+    # Keep at most one request per worker in flight. On pause, finish and save
+    # those requests; never queue the rest or discard a completed translation.
+    iterator = iter(pending)
     with ThreadPoolExecutor(max_workers=max(1, config.threads)) as executor:
-        future_map = {
-            executor.submit(call_llm, task, config): (src, task)
-            for src, task in pending
-        }
-        for future in as_completed(future_map):
-            if config.stop_event and config.stop_event.is_set():
-                executor.shutdown(wait=False, cancel_futures=True)
-                _flush()
-                if progress_callback:
-                    progress_callback(f"{stage_label}：已暂停，进度已保存。", None, None)
-                raise Stage2Paused()
+        inflight = {}
 
-            source, task = future_map[future]
-            try:
-                result = future.result()
-            except Exception as exc:
-                result = {
-                    "decision": "manual_review",
-                    "translations": {},
-                    "notes": f"LLM 请求异常：{exc}",
-                    "needs_manual_review": True,
-                }
-            with lock:
+        def submit_next():
+            if stopping():
+                return False
+            item = next(iterator, None)
+            if item is None:
+                return False
+            source, task = item
+            inflight[executor.submit(call_llm, task, config)] = (source, task)
+            return True
+
+        for _ in range(max(1, config.threads)):
+            if not submit_next():
+                break
+        while inflight:
+            finished, _ = wait(inflight, timeout=0.1, return_when=FIRST_COMPLETED)
+            for future in finished:
+                source, task = inflight.pop(future)
+                try:
+                    result = future.result()
+                except Exception as exc:
+                    result = {
+                        "decision": "manual_review", "translations": {},
+                        "notes": f"LLM 请求异常：{exc}", "needs_manual_review": True,
+                    }
                 results[source] = result
-                checkpoint_done.add(source)
+                if all(result.get("translations", {}).get(col) for col in task.missing_columns):
+                    checkpoint_done.add(source)
                 completed += 1
-                filled += apply_results_for_source(
-                    rows, task, result, config.overwrite, match_by_original
-                )
-                interval = max(1, config.flush_interval)
-                if completed % interval == 0 or completed == total_tasks:
+                filled += apply_results_for_source(rows, task, result, config.overwrite, match_by_original)
+                if completed % max(1, config.flush_interval) == 0 or completed == total_tasks or stopping():
                     _flush()
-                log_stage2_event(
-                    run_log_path,
-                    {
-                        "event": "task_done",
-                        "stage": stage_label,
-                        "run_id": run_id,
-                        "completed": completed,
-                        "total": total_tasks,
-                        "source": source,
-                        "rows": task.rows,
-                        "missing_columns": task.missing_columns,
-                        "references": task.references[:9],
-                        "result": result,
-                    },
-                )
+                log_stage2_event(run_log_path, {
+                    "event": "task_done", "stage": stage_label, "run_id": run_id,
+                    "completed": completed, "total": total_tasks, "source": source,
+                    "rows": task.rows, "missing_columns": task.missing_columns,
+                    "references": task.references[:9], "result": result,
+                })
                 if progress_callback:
-                    decision = result.get("decision", "unknown")
                     review_mark = "，需复核" if result.get("needs_manual_review") else ""
-                    if result.get("needs_manual_review"):
-                        note = str(result.get("notes", "")).strip()
-                        if note:
-                            progress_callback(f"{stage_label}：需复核原因：{note}", None, None)
+                    if result.get("needs_manual_review") and result.get("notes"):
+                        progress_callback(f"{stage_label}：需复核原因：{result['notes']}", None, None)
                     progress_callback(
-                        f"{stage_label}：{completed}/{total_tasks} 完成：{source[:40]} [{decision}{review_mark}]",
-                        completed,
-                        total_tasks,
+                        f"{stage_label}：{completed}/{total_tasks} 完成：{source[:40]}{review_mark}",
+                        completed, total_tasks,
                     )
+            if not stopping():
+                while len(inflight) < max(1, config.threads) and submit_next():
+                    pass
+    _flush()
+    if stopping():
+        if progress_callback:
+            progress_callback(f"{stage_label}：当前请求已保存，任务已暂停。", completed, total_tasks)
+        raise Stage2Paused()
     return results, filled
 
 
 def _effective_term_sources(config: Stage2Config) -> list[Path]:
     sources: list[Path] = []
     for candidate in (config.term_path, config.custom_term_path):
-        if candidate and Path(candidate).is_file():
-            sources.append(Path(candidate))
+        if candidate is not None:
+            path = Path(candidate).expanduser()
+            if not path.is_file():
+                raise ValueError(f"找不到指定的术语表：{path}")
+            if path not in sources:
+                sources.append(path)
     return sources
+
+
+def _run_signature(config: Stage2Config) -> str:
+    """Only resume results made with the same input, glossary and translation options."""
+    terms = _effective_term_sources(config) if config.use_terms else []
+    settings = {
+        "input": hashlib.sha256(config.input_path.read_bytes()).hexdigest(),
+        "terms": [hashlib.sha256(path.read_bytes()).hexdigest() for path in terms],
+        "columns": config.term_columns,
+        "delimiter": config.term_delimiter,
+        "endpoint": config.endpoint, "model": config.model,
+        "extra_prompt": config.extra_prompt,
+        "prompt": SYSTEM_PROMPT + PIVOT_SYSTEM_PROMPT + USER_PROMPT_PREFIX,
+        "overwrite": config.overwrite, "include_false": config.include_false,
+        "pivot": config.pivot_language, "only_columns": config.only_columns,
+        "nearest_top_k": config.nearest_top_k,
+        "stage1_matched_terms": config.stage1_matched_terms,
+    }
+    return hashlib.sha256(json.dumps(settings, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()
 
 
 def run_stage2(config: Stage2Config) -> dict[str, int | str]:
@@ -816,20 +829,28 @@ def run_stage2(config: Stage2Config) -> dict[str, int | str]:
     fieldnames, rows = read_input(config.input_path)
     targets = target_columns(fieldnames)
 
-    checkpoint_done = load_checkpoint(config.output_path)
+    config.checkpoint_key = _run_signature(config)
+    checkpoint_done = load_checkpoint(config.output_path, config.checkpoint_key)
     if checkpoint_done and config.progress_callback:
         config.progress_callback(f"第二阶段：检测到 checkpoint，已跳过 {len(checkpoint_done)} 组。", None, None)
 
-    # Try to resume from existing output (intermediate result)
-    existing = _read_existing_output(config.output_path)
+    # A checkpoint without its matching output cannot be resumed safely.
+    existing = _read_existing_output(config.output_path) if checkpoint_done else None
     if existing is not None:
         existing_fieldnames, existing_rows = existing
-        if existing_fieldnames == fieldnames:
-            for i, row in enumerate(existing_rows):
-                if i < len(rows):
-                    rows[i] = row
+        same_rows = len(existing_rows) == len(rows) and all(
+            old.get(SOURCE_COLUMN) == new.get(SOURCE_COLUMN)
+            and old.get(NEED_TRANSLATE_COLUMN) == new.get(NEED_TRANSLATE_COLUMN)
+            for old, new in zip(existing_rows, rows)
+        )
+        if existing_fieldnames == fieldnames and same_rows:
+            rows = existing_rows
             if config.progress_callback:
                 config.progress_callback("第二阶段：已从中间结果 CSV 恢复进度。", None, None)
+        else:
+            checkpoint_done = set()
+    else:
+        checkpoint_done = set()
 
     if config.pivot_language:
         results, filled, tasks_report = _run_stage2_pivot(
@@ -849,6 +870,8 @@ def run_stage2(config: Stage2Config) -> dict[str, int | str]:
                 config.progress_callback,
                 config.stage1_matched_terms,
                 config.nearest_top_k,
+                config.term_columns,
+                config.term_delimiter,
             )
             if config.progress_callback:
                 config.progress_callback("第二阶段：术语表参考查询完成。", 0, len(tasks))
@@ -861,7 +884,7 @@ def run_stage2(config: Stage2Config) -> dict[str, int | str]:
         tasks_report = tasks
 
     write_csv(config.output_path, fieldnames, rows)
-    save_checkpoint(config.output_path, checkpoint_done)
+    save_checkpoint(config.output_path, checkpoint_done, config.checkpoint_key)
     write_stage2_report(config.report_path, tasks_report, results)
     log_stage2_event(
         run_log_path,
@@ -918,6 +941,8 @@ def _run_stage2_pivot(
             progress_callback,
             config.stage1_matched_terms,
             config.nearest_top_k,
+            config.term_columns,
+            config.term_delimiter,
         )
     results1, filled1 = _run_llm_round(
         config, round1_tasks, rows, fieldnames, run_log_path, run_id,
@@ -998,7 +1023,7 @@ def log_stage2_event(path: Path, event: dict[str, object]) -> None:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run second-stage LLM translation.")
     parser.add_argument("--input", required=True)
-    parser.add_argument("--terms", default="", help="Term table path(s), comma-separated for multiple sources. Leave empty to use --custom-terms only.")
+    parser.add_argument("--terms", default="", help="User-supplied CSV/TSV glossary path; no default glossary.")
     parser.add_argument("--output", required=True)
     parser.add_argument("--report", required=True)
     parser.add_argument("--endpoint", default=DEFAULT_ENDPOINT)
@@ -1009,6 +1034,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--include-false", action="store_true")
     parser.add_argument("--overwrite", action="store_true")
     parser.add_argument("--custom-terms", default="", help="Optional custom term table CSV/TSV path.")
+    parser.add_argument("--term-columns", default="", help="JSON mapping file: source header to language name or code.")
+    parser.add_argument("--term-delimiter", choices=["auto", "comma", "tab", "semicolon"], default="auto")
     parser.add_argument("--pivot-language", default="", help="Pivot via a base language (e.g. 英语). Empty = direct Chinese mode.")
     parser.add_argument("--extra-prompt", default="", help="Additional instructions appended to the system prompt.")
     parser.add_argument(
@@ -1026,17 +1053,19 @@ def main() -> None:
     stats = run_stage2(
         Stage2Config(
             input_path=Path(args.input),
-            term_path=Path(args.terms),
+            term_path=Path(args.terms) if args.terms else None,
             output_path=Path(args.output),
             report_path=Path(args.report),
             endpoint=args.endpoint,
             api_key=args.api_key,
             model=args.model,
             threads=args.threads,
-            use_terms=not args.skip_terms,
+            use_terms=not args.skip_terms and bool(args.terms or args.custom_terms),
             include_false=args.include_false,
             overwrite=args.overwrite,
             custom_term_path=Path(args.custom_terms) if args.custom_terms else None,
+            term_columns=load_column_mapping(Path(args.term_columns)) if args.term_columns else None,
+            term_delimiter=args.term_delimiter,
             pivot_language=args.pivot_language,
             extra_prompt=args.extra_prompt,
             nearest_top_k=args.nearest_top_k,

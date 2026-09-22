@@ -1,5 +1,5 @@
 # -*- mode: python ; coding: utf-8 -*-
-"""PyInstaller spec for 千星奇域Direct Translator (no term table)."""
+"""PyInstaller spec for 千星奇域Direct Translator (user-supplied glossaries only)."""
 
 from pathlib import Path
 
@@ -14,7 +14,7 @@ a = Analysis(
         (str(root / "app" / "icon.ico"), "app"),
         (str(root / "app" / "app_logo.png"), "app"),
     ],
-    hiddenimports=["translate_from_terms", "llm_stage2", "validate_output", "m3_theme"],
+    hiddenimports=["ui_helpers", "glossary_dialog", "custom_glossary", "prompts", "translate_from_terms", "llm_stage2", "validate_output", "m3_theme"],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],

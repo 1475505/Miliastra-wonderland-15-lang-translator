@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Direct LLM translator GUI (no term table lookup)."""
+"""LLM translator with optional, user-supplied CSV/TSV glossaries."""
 
 from __future__ import annotations
 
@@ -10,10 +10,8 @@ import sys
 import threading
 import time
 import traceback
-import webbrowser
 from pathlib import Path
-from tkinter import BooleanVar, IntVar, Menu, PhotoImage, StringVar, Text, Tk, Toplevel, filedialog, messagebox, ttk
-from tkinter import font as tkfont
+from tkinter import BooleanVar, TclError, Menu, PhotoImage, StringVar, Text, Tk, filedialog, messagebox, ttk
 
 if sys.platform == "win32":
     import ctypes
@@ -26,6 +24,9 @@ for _p in (str(TOOLS), str(APP_DIR)):
         sys.path.insert(0, _p)
 
 import m3_theme  # noqa: E402
+from ui_helpers import inspect_input, bounded_integer, validate_endpoint, duration_label
+from custom_glossary import read_glossary  # noqa: E402
+from glossary_dialog import GlossaryDialog  # noqa: E402
 
 from llm_stage2 import (
     DEFAULT_ENDPOINT,
@@ -36,9 +37,7 @@ from llm_stage2 import (
 )  # noqa: E402
 from validate_output import validate_and_fix  # noqa: E402
 from translate_from_terms import (
-    NEED_TRANSLATE_COLUMN,
-    SOURCE_COLUMN,
-    read_input,
+    FRIENDLY_TERM_COLUMNS,
     resource_path,
     write_csv,
 )  # noqa: E402
@@ -50,53 +49,8 @@ def app_dir() -> Path:
     return ROOT
 
 
-class Tooltip:
-    """Simple hover tooltip for tkinter widgets using M3 surface styling."""
-
-    def __init__(self, widget, text: str) -> None:
-        self.widget = widget
-        self.text = text
-        self.tip_window = None
-        widget.bind("<Enter>", self.show)
-        widget.bind("<Leave>", self.hide)
-
-    def show(self, event=None) -> None:
-        if self.tip_window is not None:
-            return
-        x = self.widget.winfo_rootx() + 20
-        y = self.widget.winfo_rooty() + self.widget.winfo_height() + 8
-        self.tip_window = tw = Toplevel(self.widget)
-        tw.wm_overrideredirect(True)
-        tw.wm_geometry(f"+{x}+{y}")
-        tw.attributes("-topmost", True)
-        try:
-            tw.configure(background="#DADCE0")
-        except Exception:
-            pass
-        label = ttk.Label(
-            tw,
-            text=self.text,
-            justify="left",
-            background="#FFFFFF",
-            foreground="#1F1F1F",
-            relief="solid",
-            borderwidth=1,
-            padding=(10, 8),
-            font=("Microsoft YaHei UI", 9),
-            wraplength=360,
-        )
-        label.pack()
-
-    def hide(self, event=None) -> None:
-        if self.tip_window is not None:
-            self.tip_window.destroy()
-            self.tip_window = None
-
-
 CONFIG_PATH = app_dir() / "settings.json"
-DEEPSEEK_BUY_URL = "https://platform.deepseek.com/"
-EXTRA_PROMPT_PLACEHOLDER = "（可选）追加到 LLM system prompt 末尾的额外要求，例如：保持口语化、统一女性代词、禁止扩写……"
-APP_VERSION = "v1.03"
+APP_VERSION = "v1.05"
 MAX_RECENT_FILES = 5
 
 
@@ -118,763 +72,772 @@ def enable_high_dpi_awareness() -> None:
 class DirectTranslatorApp:
     def __init__(self) -> None:
         enable_high_dpi_awareness()
-        saved_settings = self._load_settings()
-        self._recent_files = self._load_recent_files(saved_settings)
+        saved = self._load_settings()
         self.root = Tk()
-        self.root.title(f"千星奇域15国直接翻译工具（无术语表） {APP_VERSION}")
-        saved_geo = saved_settings.get("window_geometry")
-        self.root.geometry(str(saved_geo) if isinstance(saved_geo, str) and "x" in str(saved_geo) else "1400x1020")
-        self.root.minsize(1200, 820)
-        self.m3_colors = m3_theme.apply_m3_theme(self.root)
-        self._set_window_icon()
+        self.root.title(f"千星奇域 · 多语言翻译 {APP_VERSION}")
         if sys.platform == "win32":
             try:
-                dpi = ctypes.windll.user32.GetDpiForWindow(self.root.winfo_id())
-                self.root.tk.call("tk", "scaling", dpi / 72)
+                self.root.tk.call("tk", "scaling", ctypes.windll.user32.GetDpiForWindow(self.root.winfo_id()) / 72)
             except Exception:
                 pass
-
+        self.scale = max(1.0, float(self.root.tk.call("tk", "scaling")) / (96 / 72))
+        self.m3_colors = m3_theme.apply_m3_theme(self.root)
+        self._saved_geometry = str(saved.get("window_geometry", ""))
+        try:
+            self.root.iconbitmap(str(resource_path("app/icon.ico")))
+        except TclError:
+            pass
+        recent = saved.get("recent_files", [])
+        self._recent_files = [p for p in recent if isinstance(p, str) and Path(p).is_file()][:5] if isinstance(recent, list) else []
         self.input_path = StringVar()
-        self.output_dir = StringVar(value=str(Path.cwd() / "outputs"))
-        self.run_stage3 = BooleanVar(value=False)
+        self.output_dir = StringVar(value=str(saved.get("output_dir", app_dir() / "outputs")))
+        self.glossary_path = StringVar(value=str(saved.get("glossary_path", "")))
+        mapping = saved.get("glossary_columns")
+        self.glossary_columns = mapping if isinstance(mapping, dict) and all(isinstance(k, str) and isinstance(v, str) for k, v in mapping.items()) else None
         self.overwrite = BooleanVar(value=False)
         self.force_translate_all = BooleanVar(value=False)
-        self.llm_endpoint = StringVar(value=str(saved_settings.get("llm_endpoint", DEFAULT_ENDPOINT)))
-        self.llm_model = StringVar(value=str(saved_settings.get("llm_model", DEFAULT_MODEL)))
-        self.llm_api_key = StringVar(value=str(saved_settings.get("llm_api_key", os.getenv("DEEPSEEK_API_KEY", ""))))
-        self.llm_threads = IntVar(value=int(saved_settings.get("llm_threads", 3)))
-        self.flush_interval = IntVar(value=int(saved_settings.get("flush_interval", 5)))
-        self.extra_prompt = StringVar(value=str(saved_settings.get("extra_prompt", "")))
-        self._messages: queue.Queue[tuple[str, object]] = queue.Queue()
-        self._running = False
-        self._stop_event: threading.Event | None = None
-        self.log_text: Text | None = None
-        self.extra_prompt_text: Text | None = None
-
+        self.run_stage3 = BooleanVar(value=bool(saved.get("run_stage3", False)))
+        self.llm_endpoint = StringVar(value=str(saved.get("llm_endpoint", DEFAULT_ENDPOINT)))
+        self.llm_model = StringVar(value=str(saved.get("llm_model", DEFAULT_MODEL)))
+        self.llm_api_key = StringVar(value=str(saved.get("llm_api_key", os.getenv("DEEPSEEK_API_KEY", ""))))
+        self.llm_threads = StringVar(value=str(saved.get("llm_threads", 3)))
+        self.flush_interval = StringVar(value=str(saved.get("flush_interval", 5)))
+        self.extra_prompt = StringVar(value=str(saved.get("extra_prompt", "")))
+        self.input_summary = StringVar(value="选择 CSV 后，查看行数、目标语言和待处理文本。")
+        self.glossary_summary = StringVar(value="可选 · 不导入时直接翻译")
+        self.form_feedback = StringVar()
+        self.status_title = StringVar(value="准备开始")
+        self.status_detail = StringVar(value="选择输入文件，确认模型设置后开始翻译。")
+        self.count_text = StringVar(value="—")
+        self.elapsed_text = StringVar(value="00:00")
+        self.progress_text = StringVar(value="尚未开始")
+        self.result_summary = StringVar()
+        self._messages = queue.Queue()
+        self._running, self._close_requested = False, False
+        self._state = "ready"
+        self._stop_event = self._active_config = self._started_at = None
+        self._preview_generation = 0
+        self._preview_after = self._last_preview = None
+        self._output_path = self._report_path = None
+        self._locked_widgets = []
+        self._progress_limit = 100
         self._build()
         self._fit_window()
-        self._append_log("请选择需要处理的 CSV。所有翻译由 LLM 直接生成。")
-        self.root.after(150, self._poll_messages)
-        self.root.after(200, self._set_pane_sizes)
+        self._refresh_glossary_summary()
+        for variable in (self.input_path, self.overwrite, self.force_translate_all):
+            variable.trace_add("write", self._schedule_preview)
+        self.root.bind("<Control-o>", lambda _e: self.choose_input())
+        self.root.bind("<Control-Return>", lambda _e: self.run())
+        self.root.bind("<Control-period>", lambda _e: self.stop())
+        self.root.bind("<F1>", lambda _e: self.show_help())
+        self.root.after(80, self._poll_messages)
+        self.root.after(1000, self._tick)
+        self.root.after(150, lambda: self._body_pane.sashpos(0, int(self._body_pane.winfo_width() * 0.57)))
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
+        self._append_log("准备就绪。先选择输入文件；术语表可选。")
 
-    def _on_close(self) -> None:
+    def _load_settings(self):
         try:
-            self._save_settings()
-        except Exception:
-            pass
-        self.root.destroy()
+            data = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+            return data if isinstance(data, dict) else {}
+        except (OSError, ValueError):
+            return {}
 
-    def _set_pane_sizes(self) -> None:
-        """Lock the left pane to ~70% width and the right log pane narrow."""
-        try:
-            body = getattr(self, "_body_pane", None)
-            if body is None:
-                return
-            body_width = body.winfo_width()
-            left_width = max(900, int(body_width * 0.72))
-            body.sashpos(0, left_width)
-        except Exception:
-            pass
-
-    def _fit_window(self) -> None:
-        """Size the window so the full layout is visible, clamped to the screen."""
-        try:
-            self.root.update_idletasks()
-            req_w = self.root.winfo_reqwidth()
-            req_h = self.root.winfo_reqheight()
-            sw = self.root.winfo_screenwidth()
-            sh = self.root.winfo_screenheight()
-            min_w, min_h = 1200, 820
-            max_w = int(sw * 0.98)
-            max_h = int(sh * 0.98)
-            # Use the explicitly configured geometry, clamped to the screen.
-            cur = self.root.geometry()
-            parts = cur.split("+")[0].split("x")
-            req_w = int(parts[0]) if len(parts) == 2 else 1320
-            req_h = int(parts[1]) if len(parts) == 2 else 880
-            w = max(min_w, min(req_w, max_w))
-            h = max(min_h, min(req_h, max_h))
-            x = max(0, (sw - w) // 2)
-            y = max(0, (sh - h) // 4)
-            self.root.geometry(f"{w}x{h}+{x}+{y}")
-            self.root.minsize(min_w, min_h)
-        except Exception:
-            pass
-
-    def _set_window_icon(self) -> None:
-        """Set the window icon from the packaged or source app/icon.ico."""
-        try:
-            icon_path = resource_path("app/icon.ico")
-            if icon_path.is_file():
-                self.root.iconbitmap(str(icon_path))
-        except Exception:
-            pass
-
-    def _load_settings(self) -> dict[str, object]:
-        try:
-            if CONFIG_PATH.is_file():
-                with CONFIG_PATH.open("r", encoding="utf-8") as f:
-                    data = json.load(f)
-                if isinstance(data, dict):
-                    return data
-        except Exception:
-            pass
-        return {}
-
-    def _save_settings(self) -> None:
-        data = {
-            "llm_endpoint": self.llm_endpoint.get().strip(),
-            "llm_model": self.llm_model.get().strip(),
-            "llm_api_key": self.llm_api_key.get().strip(),
-            "llm_threads": int(self.llm_threads.get()),
-            "flush_interval": int(self.flush_interval.get()),
-            "extra_prompt": self.extra_prompt.get().strip(),
-            "recent_files": self._recent_files,
-            "window_geometry": self.root.geometry(),
-        }
+    def _save_settings(self):
+        self._sync_extra_prompt()
+        names = ("llm_endpoint", "llm_model", "llm_api_key", "llm_threads", "flush_interval",
+                 "extra_prompt", "glossary_path", "output_dir", "run_stage3")
+        data = {name: getattr(self, name).get() for name in names}
+        data.update(glossary_columns=self.glossary_columns, recent_files=self._recent_files,
+                    window_geometry=self.root.geometry())
         CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
-        with CONFIG_PATH.open("w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
+        CONFIG_PATH.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
 
-    def _load_recent_files(self, settings: dict[str, object]) -> list[str]:
-        recent = settings.get("recent_files")
-        if isinstance(recent, list):
-            return [str(p) for p in recent if isinstance(p, str) and Path(p).is_file()][:MAX_RECENT_FILES]
-        return []
+    def _fit_window(self):
+        sw, sh = self.root.winfo_screenwidth(), self.root.winfo_screenheight()
+        max_w, max_h = max(600, sw - 40), max(440, sh - 90)
+        width, height = int(1180 * self.scale), int(820 * self.scale)
+        try:
+            geometry = self._saved_geometry.split("+")[0].split("-")[0].split("x")
+            if len(geometry) == 2:
+                width, height = map(int, geometry)
+        except ValueError:
+            pass
+        min_w, min_h = min(int(920 * self.scale), max_w), min(int(620 * self.scale), max_h)
+        width, height = min(max_w, max(min_w, width)), min(max_h, max(min_h, height))
+        self.root.geometry(f"{width}x{height}+{max(0,(sw-width)//2)}+{max(0,(sh-height)//3)}")
+        self.root.minsize(min_w, min_h)
 
-    def _add_recent_file(self, path: str) -> None:
-        path = str(path)
-        if path in self._recent_files:
-            self._recent_files.remove(path)
-        self._recent_files.insert(0, path)
-        self._recent_files = self._recent_files[:MAX_RECENT_FILES]
-        self._update_recent_menu()
+    def _wrap(self, label, parent, margin=36):
+        parent.bind("<Configure>", lambda e: label.configure(wraplength=max(100, e.width-margin)), add="+")
 
-    def _update_recent_menu(self) -> None:
-        if not hasattr(self, "recent_menu"):
-            return
-        self.recent_menu.delete(0, "end")
-        if not self._recent_files:
-            self.recent_menu.add_command(label="（无最近文件）", state="disabled")
-            return
-        for p in self._recent_files:
-            self.recent_menu.add_command(
-                label=p,
-                command=lambda path=p: self._set_input_from_recent(path),
-            )
+    def _card(self, parent, title, subtitle=None):
+        card = ttk.Frame(parent, style="Card.TFrame", padding=16)
+        card.pack(fill="x", pady=(0, 12))
+        ttk.Label(card, text=title, style="Section.TLabel").pack(anchor="w", pady=(0, 10))
+        if subtitle:
+            label = ttk.Label(card, text=subtitle, style="CardCaption.TLabel", wraplength=380)
+            label.pack(fill="x", pady=(0, 10))
+            self._wrap(label, card)
+        return card
 
-    def _set_input_from_recent(self, path: str) -> None:
-        self.input_path.set(path)
-        if not self.output_dir.get():
-            self.output_dir.set(str(Path(path).parent / "outputs"))
-
-    def _sync_extra_prompt(self) -> None:
-        if hasattr(self, "extra_prompt_text"):
-            value = self.extra_prompt_text.get("1.0", "end-1c").strip()
-            if value == EXTRA_PROMPT_PLACEHOLDER:
-                value = ""
-            self.extra_prompt.set(value)
-
-    def _setup_prompt_placeholder(self, widget: Text) -> None:
-        """Show grey placeholder text when the extra-prompt box is empty."""
+    def _build(self):
         c = self.m3_colors
-
-        def _is_placeholder() -> bool:
-            return widget.get("1.0", "end-1c").strip() == EXTRA_PROMPT_PLACEHOLDER
-
-        def _on_focus_in(_event=None) -> None:
-            if _is_placeholder():
-                widget.delete("1.0", "end")
-                widget.configure(foreground=c["text"])
-
-        def _on_focus_out(_event=None) -> None:
-            if not widget.get("1.0", "end-1c").strip():
-                widget.insert("1.0", EXTRA_PROMPT_PLACEHOLDER)
-                widget.configure(foreground=c["outline"])
-
-        widget.bind("<FocusIn>", _on_focus_in)
-        widget.bind("<FocusOut>", _on_focus_out)
-        if not widget.get("1.0", "end-1c").strip():
-            widget.insert("1.0", EXTRA_PROMPT_PLACEHOLDER)
-            widget.configure(foreground=c["outline"])
-
-    def _build(self) -> None:
-        c = self.m3_colors
-        # Layout note: bottom-docked widgets (action bar, progress, caption) are
-        # packed with side="bottom" BEFORE the body pane, so pack always grants
-        # them their requested height first. This keeps the controls visible on
-        # high-DPI displays where the content requests more space than the window.
         outer = ttk.Frame(self.root, padding=18)
         outer.pack(fill="both", expand=True)
-
-        # --- Header: logo + title/subtitle + tonal badge ---
         header = ttk.Frame(outer)
-        header.pack(side="top", fill="x", pady=(0, 12))
+        header.pack(fill="x", pady=(0, 16))
+        ttk.Button(header, text="使用说明  F1", style="Text.TButton", command=self.show_help).pack(side="right")
+        try:
+            self._logo_img = PhotoImage(file=str(resource_path("app/app_logo.png"))).subsample(3, 3)
+            ttk.Label(header, image=self._logo_img).pack(side="left", padx=(0, 12))
+        except TclError:
+            pass
+        titles = ttk.Frame(header)
+        titles.pack(side="left", fill="x", expand=True)
+        ttk.Label(titles, text="千星奇域 · 多语言翻译", style="Title.TLabel").pack(anchor="w")
+        ttk.Label(titles, text="简体中文 → 14 种语言    /    自定义术语 · 统一译名", style="Caption.TLabel").pack(anchor="w", pady=(3, 0))
+        footer = ttk.Frame(outer)
+        footer.pack(side="bottom", fill="x", pady=(12, 0))
+        actions = ttk.Frame(footer)
+        actions.pack(fill="x")
+        self.run_button = ttk.Button(actions, text="开始翻译", style="M3.TButton", command=self.run)
+        self.run_button.pack(side="right", padx=(8, 0))
+        self.stop_button = ttk.Button(actions, text="暂停", style="Tonal.TButton", command=self.stop, state="disabled")
+        self.stop_button.pack(side="right")
+        ttk.Label(actions, text="Ctrl+O  选择文件\nCtrl+Enter  开始 / 继续", style="Caption.TLabel").pack(side="left")
+        ttk.Label(footer, text=f"{APP_VERSION}  ·  仅供学习交流，禁止售卖  ·  QQ 群 1007538100",
+                  style="Caption.TLabel").pack(anchor="w", pady=(10, 0))
+        self._body_pane = ttk.PanedWindow(outer, orient="horizontal")
+        self._body_pane.pack(fill="both", expand=True)
+        left, right = ttk.Frame(self._body_pane), ttk.Frame(self._body_pane)
+        self._body_pane.add(left, weight=3)
+        self._body_pane.add(right, weight=2)
+        self.workspace_tabs = ttk.Notebook(left)
+        self.workspace_tabs.pack(fill="both", expand=True, padx=(0, 12))
+        self.task_panel = m3_theme.ScrollableFrame(self.workspace_tabs, colors=c)
+        self.settings_panel = m3_theme.ScrollableFrame(self.workspace_tabs, colors=c)
+        self.workspace_tabs.add(self.task_panel, text="翻译任务")
+        self.workspace_tabs.add(self.settings_panel, text="模型设置")
+        self._build_task_form(self.task_panel.content)
+        self._build_settings(self.settings_panel.content)
+        self.feedback_label = ttk.Label(left, textvariable=self.form_feedback, foreground=c["error"],
+                                        style="Caption.TLabel", wraplength=400)
+        self.feedback_label.pack(fill="x", pady=(6, 0))
+        self._wrap(self.feedback_label, left)
+        status = self._card(right, "本次任务")
+        self.status_label = ttk.Label(status, textvariable=self.status_title, style="Status.TLabel")
+        self.status_label.pack(anchor="w")
+        detail = ttk.Label(status, textvariable=self.status_detail, style="CardCaption.TLabel", wraplength=320)
+        detail.pack(fill="x", pady=(7, 14))
+        self._wrap(detail, status)
+        metrics = ttk.Frame(status, style="Card.TFrame")
+        metrics.pack(fill="x")
+        for column, (caption, variable) in enumerate((("文本组", self.count_text), ("已用时间", self.elapsed_text))):
+            metrics.columnconfigure(column, weight=1)
+            ttk.Label(metrics, text=caption, style="CardCaption.TLabel").grid(row=0, column=column, sticky="w")
+            ttk.Label(metrics, textvariable=variable, style="Metric.TLabel").grid(row=1, column=column, sticky="w", pady=(3, 10))
+        self.progress = ttk.Progressbar(status, maximum=100, mode="determinate")
+        self.progress.pack(fill="x")
+        ttk.Label(status, textvariable=self.progress_text, style="CardCaption.TLabel").pack(anchor="w", pady=(7, 0))
+        self.result_card = self._card(right, "输出文件")
+        result_label = ttk.Label(self.result_card, textvariable=self.result_summary, style="CardCaption.TLabel", wraplength=320)
+        result_label.pack(fill="x", pady=(0, 10))
+        self._wrap(result_label, self.result_card)
+        row = ttk.Frame(self.result_card, style="Card.TFrame")
+        row.pack(fill="x")
+        self.result_button = ttk.Button(row, text="打开结果", style="Compact.TButton", command=lambda: self._open_path(self._output_path))
+        self.result_button.pack(side="left", padx=(0, 6))
+        self.report_button = ttk.Button(row, text="查看报告", style="Compact.TButton", command=lambda: self._open_path(self._report_path))
+        self.report_button.pack(side="left", padx=(0, 6))
+        ttk.Button(row, text="所在文件夹", style="Compact.TButton", command=self.open_output_dir).pack(side="left")
+        self.result_card.pack_forget()
+        self.detail_tabs = ttk.Notebook(right)
+        self.detail_tabs.pack(fill="both", expand=True)
+        self.preview_tab = ttk.Frame(self.detail_tabs, padding=10, style="Card.TFrame")
+        self.log_tab = ttk.Frame(self.detail_tabs, padding=10, style="Card.TFrame")
+        self.detail_tabs.add(self.preview_tab, text="输入预览")
+        self.detail_tabs.add(self.log_tab, text="运行日志")
+        ttk.Label(self.preview_tab, text="预览前 30 行 · 原始文件保持不变", style="CardCaption.TLabel").pack(anchor="w", pady=(0, 8))
+        tree_frame = ttk.Frame(self.preview_tab, style="Card.TFrame")
+        tree_frame.pack(fill="both", expand=True)
+        tree_frame.columnconfigure(0, weight=1)
+        tree_frame.rowconfigure(0, weight=1)
+        self.input_tree = ttk.Treeview(tree_frame, columns=("empty",), show="headings", height=5)
+        self.input_tree.heading("empty", text="选择文件后，在这里预览")
+        self.input_tree.column("empty", width=260, stretch=True)
+        self.input_tree.grid(row=0, column=0, sticky="nsew")
+        ybar = ttk.Scrollbar(tree_frame, orient="vertical", command=self.input_tree.yview)
+        ybar.grid(row=0, column=1, sticky="ns")
+        xbar = ttk.Scrollbar(tree_frame, orient="horizontal", command=self.input_tree.xview)
+        xbar.grid(row=1, column=0, sticky="ew")
+        self.input_tree.configure(yscrollcommand=ybar.set, xscrollcommand=xbar.set)
+        row = ttk.Frame(self.log_tab, style="Card.TFrame")
+        row.pack(fill="x", pady=(0, 6))
+        ttk.Label(row, text="详细过程与错误信息", style="CardCaption.TLabel").pack(side="left")
+        ttk.Button(row, text="复制", style="Compact.TButton", command=self._copy_log).pack(side="right")
+        ttk.Button(row, text="清空", style="Compact.TButton", command=self._clear_log).pack(side="right", padx=6)
+        log_body = ttk.Frame(self.log_tab, style="Card.TFrame")
+        log_body.pack(fill="both", expand=True)
+        self.log_text = Text(log_body, height=5, width=20, wrap="word", state="disabled", relief="flat",
+                             background=c["surface"], foreground=c["text_secondary"], font=("Microsoft YaHei UI", 9), padx=4, pady=4)
+        bar = ttk.Scrollbar(log_body, orient="vertical", command=self.log_text.yview)
+        bar.pack(side="right", fill="y")
+        self.log_text.pack(fill="both", expand=True)
+        self.log_text.configure(yscrollcommand=bar.set)
 
-        # Accent bar spans the full header width at the bottom of the header.
-        accent = ttk.Frame(header, height=3, style="Accent.TFrame")
-        accent.pack(side="bottom", fill="x", pady=(12, 0))
-        # Tonal badge docks right first so it is never clipped on narrow windows.
-        badge = ttk.Frame(header, style="Badge.TFrame", padding=(12, 5))
-        badge.pack(side="right", anchor="n", pady=(6, 0))
-        ttk.Label(badge, text="无术语表模式", style="Badge.TLabel").pack()
-
-        self._logo_img = self._load_logo()
-        if self._logo_img is not None:
-            ttk.Label(header, image=self._logo_img).pack(side="left", padx=(0, 14))
-        title_box = ttk.Frame(header)
-        title_box.pack(side="left", fill="x", expand=True)
-        ttk.Label(title_box, text="千星奇域15国直接翻译工具", style="Title.TLabel").pack(
-            anchor="w", pady=(2, 0)
-        )
-        ttk.Label(
-            title_box,
-            text="无术语表 · 由 LLM 直接生成 15 国语言翻译",
-            style="Subtitle.TLabel",
-        ).pack(anchor="w", pady=(2, 0))
-
-        # --- Body: left scrollable config + right log (packed at the end) ---
-        body = ttk.PanedWindow(outer, orient="horizontal")
-        self._body_pane = body
-
-        left = m3_theme.ScrollableFrame(body, colors=c)
-        left.content.columnconfigure(0, weight=1)
-        right = ttk.Frame(body)
-        right.columnconfigure(0, weight=1)
-        right.rowconfigure(0, weight=1)
-
-        body.add(left, weight=4)
-        body.add(right, weight=1)
-        cfg = left.content
-        right.rowconfigure(0, weight=1)
-
-        # --- I/O card ---
-        io_card = ttk.LabelFrame(cfg, text="文件", style="M3.TLabelframe")
-        io_card.grid(row=0, column=0, sticky="ew", pady=(0, 10))
-        io_card.columnconfigure(1, weight=1)
-
-        ttk.Label(io_card, text="输入 CSV").grid(row=0, column=0, sticky="w", pady=4)
-        ttk.Entry(io_card, textvariable=self.input_path).grid(
-            row=0, column=1, sticky="ew", padx=8
-        )
-        ttk.Button(io_card, text="选择...", style="Surface.TButton", command=self.choose_input).grid(
-            row=0, column=2, sticky="ew", padx=(0, 6)
-        )
-        self.recent_menu_btn = ttk.Menubutton(
-            io_card, text="最近", style="Surface.TButton", direction="below"
-        )
-        self.recent_menu_btn.grid(row=0, column=3, sticky="ew")
+    def _build_task_form(self, parent):
+        card = self._card(parent, "01  选择翻译文件")
+        row = ttk.Frame(card, style="Card.TFrame")
+        row.pack(fill="x")
+        self.input_entry = ttk.Entry(row, textvariable=self.input_path, width=18)
+        self.input_entry.pack(side="left", fill="x", expand=True, padx=(0, 6))
+        ttk.Button(row, text="选择 CSV", style="Compact.TButton", command=self.choose_input).pack(side="left")
+        self.recent_menu_btn = ttk.Menubutton(row, text="最近", style="Compact.TButton")
+        self.recent_menu_btn.pack(side="left", padx=(6, 0))
         self.recent_menu = Menu(self.recent_menu_btn, tearoff=0)
         self.recent_menu_btn.configure(menu=self.recent_menu)
         self._update_recent_menu()
-
-        ttk.Label(io_card, text="输出目录").grid(row=1, column=0, sticky="w", pady=4)
-        ttk.Entry(io_card, textvariable=self.output_dir).grid(
-            row=1, column=1, sticky="ew", padx=8
-        )
-        ttk.Button(io_card, text="选择...", style="Surface.TButton", command=self.choose_output_dir).grid(
-            row=1, column=2, sticky="ew"
-        )
-
-        # --- Options card ---
-        options = ttk.LabelFrame(cfg, text="翻译选项", style="M3.TLabelframe")
-        options.grid(row=1, column=0, sticky="ew", pady=(0, 10))
-        cb = ttk.Checkbutton(options, text="覆盖已有", style="G.TCheckbutton", variable=self.overwrite)
-        cb.grid(row=0, column=0, sticky="w", padx=(0, 16))
-        Tooltip(cb, "即使目标语言列已有内容，也用 LLM 翻译重新填充。")
-        cb = ttk.Checkbutton(
-            options, text="强制全部翻译", style="G.TCheckbutton", variable=self.force_translate_all
-        )
-        cb.grid(row=0, column=1, sticky="w", padx=(0, 16))
-        Tooltip(cb, "将所有行的「是否需要翻译」列强制改为 TRUE，全部参与翻译。")
-        cb = ttk.Checkbutton(options, text="后处理验证", style="G.TCheckbutton", variable=self.run_stage3)
-        cb.grid(row=0, column=2, sticky="w")
-        Tooltip(cb, "修正 protected token 错误并检查同一中文是否对应不同翻译。")
-
-        # --- LLM options card ---
-        llm = ttk.LabelFrame(cfg, text="LLM 选项", style="M3.TLabelframe")
-        llm.grid(row=2, column=0, sticky="ew", pady=(0, 10))
-        llm.columnconfigure(1, weight=1)
-        llm.columnconfigure(3, weight=1)
-
-        ttk.Label(llm, text="Endpoint").grid(row=0, column=0, sticky="w", pady=4)
-        ent = ttk.Entry(llm, textvariable=self.llm_endpoint)
-        ent.grid(row=0, column=1, columnspan=3, sticky="ew", padx=(8, 0), pady=4)
-        Tooltip(ent, "LLM API 的 OpenAI 兼容接口地址。默认使用 DeepSeek。")
-
-        ttk.Label(llm, text="Model").grid(row=1, column=0, sticky="w", pady=4)
-        ent = ttk.Entry(llm, textvariable=self.llm_model)
-        ent.grid(row=1, column=1, sticky="ew", padx=(8, 16), pady=4)
-        Tooltip(ent, "LLM 模型名称。默认 deepseek-v4-flash。")
-
-        ttk.Label(llm, text="API Key").grid(row=1, column=2, sticky="w", pady=4)
-        ent = ttk.Entry(llm, textvariable=self.llm_api_key, show="*")
-        ent.grid(row=1, column=3, sticky="ew", padx=(8, 0), pady=4)
-        Tooltip(ent, "LLM 服务商提供的 API Key。")
-
-        ttk.Label(llm, text="线程").grid(row=2, column=0, sticky="w", pady=4)
-        sp = ttk.Spinbox(llm, from_=1, to=16, width=8, textvariable=self.llm_threads)
-        sp.grid(row=2, column=1, sticky="w", padx=(8, 16), pady=4)
-        Tooltip(sp, "同时请求 LLM 的并发数量。建议 1~5，过高可能触发 API 限流。")
-
-        ttk.Label(llm, text="写入间隔").grid(row=2, column=2, sticky="w", pady=4)
-        sp = ttk.Spinbox(llm, from_=1, to=50, width=8, textvariable=self.flush_interval)
-        sp.grid(row=2, column=3, sticky="w", padx=(8, 0), pady=4)
-        Tooltip(sp, "每完成多少个 LLM 任务就实时写入一次结果 CSV。")
-
-        # Custom extra prompt
-        ttk.Label(llm, text="自定义额外提示词").grid(row=3, column=0, sticky="nw", pady=(10, 4))
-        prompt_frame = ttk.Frame(llm)
-        prompt_frame.grid(row=3, column=1, columnspan=3, sticky="ew", padx=(8, 0), pady=(10, 4))
-        prompt_frame.columnconfigure(0, weight=1)
-        self.extra_prompt_text = Text(
-            prompt_frame,
-            height=3,
-            wrap="word",
-            relief="solid",
-            borderwidth=1,
-            background=c["surface"],
-            foreground=c["text"],
-            insertbackground=c["primary"],
-            highlightbackground=c["outline_variant"],
-            highlightcolor=c["border_focus"],
-            font=("Microsoft YaHei UI", 10),
-            padx=10,
-            pady=8,
-        )
-        self.extra_prompt_text.grid(row=0, column=0, sticky="ew")
+        self.input_summary_label = ttk.Label(card, textvariable=self.input_summary, style="CardCaption.TLabel", wraplength=400)
+        self.input_summary_label.pack(fill="x", pady=(9, 14))
+        self._wrap(self.input_summary_label, card)
+        ttk.Label(card, text="输出目录", style="CardCaption.TLabel").pack(anchor="w", pady=(0, 5))
+        row = ttk.Frame(card, style="Card.TFrame")
+        row.pack(fill="x")
+        self.output_entry = ttk.Entry(row, textvariable=self.output_dir, width=18)
+        self.output_entry.pack(side="left", fill="x", expand=True, padx=(0, 6))
+        ttk.Button(row, text="更改", style="Compact.TButton", command=self.choose_output_dir).pack(side="left")
+        card = self._card(parent, "02  自定义术语表", "使用你的固定译名，保持不同文本中的术语一致。")
+        label = ttk.Label(card, textvariable=self.glossary_summary, style="Card.TLabel", wraplength=400)
+        label.pack(fill="x", pady=(0, 10))
+        self._wrap(label, card)
+        row = ttk.Frame(card, style="Card.TFrame")
+        row.pack(fill="x")
+        self.glossary_import_button = ttk.Button(row, text="导入术语表", style="Compact.TButton", command=self.choose_glossary)
+        self.glossary_import_button.pack(side="left", padx=(0, 6))
+        self.glossary_mapping_button = ttk.Button(row, text="修改列映射", style="Compact.TButton", command=self.edit_glossary_mapping, state="disabled")
+        self.glossary_mapping_button.pack(side="left", padx=(0, 6))
+        self.glossary_clear_button = ttk.Button(row, text="移除", style="Compact.TButton", command=self.clear_glossary, state="disabled")
+        self.glossary_clear_button.pack(side="left")
+        ttk.Button(card, text="导出空白模板", style="Text.TButton", command=self.export_glossary_template).pack(anchor="w", pady=(7, 0))
+        card = self._card(parent, "03  翻译偏好", "默认只填写空白译文，并跳过标记为不翻译的行。")
+        for label, variable in (("覆盖已有译文", self.overwrite), ("忽略不翻译标记，处理所有行", self.force_translate_all),
+                                ("完成后检查标签与译文一致性", self.run_stage3)):
+            ttk.Checkbutton(card, text=label, variable=variable, style="G.TCheckbutton").pack(anchor="w", pady=3)
+        ttk.Label(card, text="额外要求（可选）", style="CardCaption.TLabel").pack(anchor="w", pady=(12, 6))
+        c = self.m3_colors
+        self.extra_prompt_text = Text(card, height=3, width=20, wrap="word", relief="flat", borderwidth=1,
+                                      highlightthickness=1, highlightbackground=c["outline_variant"],
+                                      highlightcolor=c["primary"], font=("Microsoft YaHei UI", 10), padx=8, pady=8)
+        self.extra_prompt_text.pack(fill="x")
         self.extra_prompt_text.insert("1.0", self.extra_prompt.get())
-        self._setup_prompt_placeholder(self.extra_prompt_text)
+        ttk.Label(card, text="例如：保持口语化；统一女性代词；不要扩写。", style="CardCaption.TLabel").pack(anchor="w", pady=(6, 0))
 
-        # --- Action bar (bottom-docked below; packed at the end of _build) ---
-        action_bar = ttk.Frame(outer)
-        action_bar.columnconfigure(0, weight=1)
-        action_bar.columnconfigure(1, weight=1)
-        action_bar.columnconfigure(2, weight=1)
-        action_bar.columnconfigure(3, weight=1)
+    def _build_settings(self, parent):
+        card = self._card(parent, "连接翻译模型", "设置会保存在本机；支持兼容 Chat Completions 的接口。")
+        for title, variable, name in (("服务地址（Endpoint）", self.llm_endpoint, "endpoint_entry"),
+                                      ("模型名称（Model）", self.llm_model, "model_entry")):
+            ttk.Label(card, text=title, style="CardCaption.TLabel").pack(anchor="w", pady=(0, 5))
+            entry = ttk.Entry(card, textvariable=variable, width=20)
+            entry.pack(fill="x", pady=(0, 14))
+            setattr(self, name, entry)
+        ttk.Label(card, text="API Key", style="CardCaption.TLabel").pack(anchor="w", pady=(0, 5))
+        row = ttk.Frame(card, style="Card.TFrame")
+        row.pack(fill="x")
+        self.api_key_entry = ttk.Entry(row, textvariable=self.llm_api_key, show="*", width=16)
+        self.api_key_entry.pack(side="left", fill="x", expand=True, padx=(0, 6))
+        self.api_visibility_button = ttk.Button(row, text="显示", style="Compact.TButton", command=self._toggle_api_key)
+        self.api_visibility_button.pack(side="left")
+        label = ttk.Label(card, text="源文及匹配术语会发送到上述接口。API Key 保存在本机 settings.json 中。",
+                          style="CardCaption.TLabel", wraplength=400)
+        label.pack(fill="x", pady=(12, 0))
+        self._wrap(label, card)
+        card = self._card(parent, "运行参数")
+        self.advanced_button = ttk.Button(card, text="展开高级设置 ▾", style="Text.TButton", command=self._toggle_advanced)
+        self.advanced_button.pack(anchor="w")
+        self.advanced_frame = ttk.Frame(card, style="Card.TFrame")
+        for index, (title, variable, limit) in enumerate((("并发请求数", self.llm_threads, 16), ("自动保存间隔", self.flush_interval, 50))):
+            ttk.Label(self.advanced_frame, text=title, style="Card.TLabel").grid(row=index, column=0, sticky="w", pady=8, padx=(0, 12))
+            spinbox = ttk.Spinbox(self.advanced_frame, textvariable=variable, from_=1, to=limit, width=7)
+            spinbox.grid(row=index, column=1, sticky="w")
+            setattr(self, "threads_spinbox" if index == 0 else "flush_spinbox", spinbox)
+        ttk.Label(self.advanced_frame, text="并发建议 1–5；保存间隔单位为文本组。",
+                  style="CardCaption.TLabel").grid(row=2, column=0, columnspan=2, sticky="w", pady=8)
+        self._advanced_open = False
 
-        self.run_button = ttk.Button(action_bar, text="开始翻译", style="M3.TButton", command=self.run)
-        self.run_button.grid(row=0, column=0, sticky="ew", padx=(0, 6))
-        self.stop_button = ttk.Button(
-            action_bar, text="暂停", style="Tonal.TButton", command=self.stop, state="disabled"
-        )
-        self.stop_button.grid(row=0, column=1, sticky="ew", padx=(0, 6))
-        ttk.Button(action_bar, text="打开输出目录", style="Surface.TButton", command=self.open_output_dir).grid(
-            row=0, column=2, sticky="ew", padx=(0, 6)
-        )
-        ttk.Button(action_bar, text="使用说明", style="Outline.TButton", command=self.show_help).grid(
-            row=0, column=3, sticky="ew"
-        )
 
-        # --- Log card (right pane, expands) ---
-        log_box = ttk.LabelFrame(right, text="日志", style="M3.TLabelframe")
-        log_box.grid(row=0, column=0, sticky="nsew")
-        log_box.rowconfigure(0, weight=1)
-        log_box.columnconfigure(0, weight=1)
-        clear_btn = ttk.Button(
-            log_box, text="清空", style="Text.TButton", command=self._clear_log
-        )
-        clear_btn.place(relx=1.0, x=-10, y=6, anchor="ne")
-        self.log_text = Text(
-            log_box,
-            height=8,
-            width=48,
-            wrap="word",
-            relief="flat",
-            state="disabled",
-            background=c["surface_container_low"],
-            foreground=c["text"],
-            insertbackground=c["primary"],
-            font=("Cascadia Mono", 10),
-            padx=10,
-            pady=8,
-            spacing1=1,
-            spacing3=1,
-        )
-        self.log_text.grid(row=0, column=0, sticky="nsew")
-        scrollbar = ttk.Scrollbar(log_box, orient="vertical", command=self.log_text.yview)
-        scrollbar.grid(row=0, column=1, sticky="ns")
-        self.log_text.configure(yscrollcommand=scrollbar.set)
 
-        self.progress = ttk.Progressbar(outer, mode="determinate", maximum=100, value=0)
+    def _toggle_advanced(self):
+        self._advanced_open = not self._advanced_open
+        if self._advanced_open:
+            self.advanced_frame.pack(fill="x", pady=(8, 0))
+        else:
+            self.advanced_frame.pack_forget()
+        self.advanced_button.configure(text="收起高级设置 ▴" if self._advanced_open else "展开高级设置 ▾")
 
-        # Single unobtrusive license / contact line at the very bottom.
-        caption = ttk.Label(
-            outer,
-            text="仅供学习交流使用 · 禁止售卖和对外分享 · 用户QQ群：1007538100",
-            style="Caption.TLabel",
-        )
-        # Bottom dock order (first packed = lowest): caption, progress, action bar.
-        # Packing these before the body guarantees they are never clipped when the
-        # window is shorter than the requested content height (e.g. 150% DPI).
-        caption.pack(side="bottom", anchor="w", pady=(2, 0))
-        self.progress.pack(side="bottom", fill="x", pady=(6, 2))
-        action_bar.pack(side="bottom", fill="x", pady=(0, 10))
+    def _toggle_api_key(self):
+        visible = bool(self.api_key_entry.cget("show"))
+        self.api_key_entry.configure(show="" if visible else "*")
+        self.api_visibility_button.configure(text="隐藏" if visible else "显示")
 
-        # Body fills whatever space remains between header and bottom bar.
-        body.pack(side="top", fill="both", expand=True)
+    def _sync_extra_prompt(self):
+        self.extra_prompt.set(self.extra_prompt_text.get("1.0", "end-1c").strip())
 
-    def _load_logo(self) -> PhotoImage | None:
-        """Load the header logo (96px asset downsampled to 48px)."""
-        try:
-            logo_path = resource_path("app/app_logo.png")
-            if logo_path.is_file():
-                return PhotoImage(file=str(logo_path)).subsample(2, 2)
-        except Exception:
-            pass
-        return None
+    def _update_recent_menu(self):
+        self.recent_menu.delete(0, "end")
+        for path in self._recent_files:
+            self.recent_menu.add_command(label=path, command=lambda p=path: self._select_input(p))
+        if not self._recent_files:
+            self.recent_menu.add_command(label="暂无最近文件", state="disabled")
 
-    def _append_log(self, message: str) -> None:
-        if self.log_text is None:
+    def _select_input(self, path):
+        if self._running:
             return
+        self.input_path.set(str(path))
+        self._recent_files = ([str(path)] + [p for p in self._recent_files if p != str(path)])[:MAX_RECENT_FILES]
+        self._update_recent_menu()
+        self.workspace_tabs.select(self.task_panel)
+        self.detail_tabs.select(self.preview_tab)
+
+    def choose_input(self):
+        if not self._running:
+            path = filedialog.askopenfilename(title="选择多语言文本 CSV", filetypes=[("CSV 文件", "*.csv"), ("所有文件", "*.*")])
+            if path:
+                self._select_input(path)
+
+    def _schedule_preview(self, *_):
+        self._preview_generation += 1
+        if self._preview_after:
+            self.root.after_cancel(self._preview_after)
+        self._preview_after = self.root.after(300, self._start_preview)
+
+    def _start_preview(self):
+        self._preview_after = None
+        generation = self._preview_generation
+        path = self.input_path.get().strip()
+        options = (self.force_translate_all.get(), self.overwrite.get())
+        self._last_preview = None
+        if not path:
+            self.input_summary.set("选择 CSV 后，查看行数、目标语言和待处理文本。")
+            self.input_tree.delete(*self.input_tree.get_children())
+            return
+        self.input_summary.set("正在读取文件…")
+        def inspect():
+            try:
+                result = inspect_input(Path(path).expanduser(), *options)
+                self._messages.put(("preview", (generation, result, None)))
+            except Exception as exc:
+                self._messages.put(("preview", (generation, None, str(exc))))
+        threading.Thread(target=inspect, daemon=True).start()
+
+    def _display_preview(self, result):
+        headers, rows, summary = result
+        self._last_preview = result
+        self.input_summary.set(f"{summary['rows']} 行 · {summary['targets']} 种目标语言 · {summary['groups']} 组待处理文本")
+        self.input_summary_label.configure(style="CardCaption.TLabel")
+        self.input_tree.delete(*self.input_tree.get_children())
+        columns = [f"c{i}" for i in range(len(headers))]
+        self.input_tree.configure(columns=columns)
+        for column, header in zip(columns, headers):
+            self.input_tree.heading(column, text=header)
+            self.input_tree.column(column, width=int((200 if header == "简体中文" else 130) * self.scale), stretch=False)
+        for row in rows:
+            self.input_tree.insert("", "end", values=[str(row.get(h, ""))[:250].replace("\n", " ↵ ") for h in headers])
+        if not self._running and self._state == "ready":
+            self.count_text.set(str(summary["groups"]))
+
+    def _refresh_glossary_summary(self, count=None):
+        selected = bool(self.glossary_path.get())
+        if selected:
+            languages = len(self.glossary_columns or {}) - 1
+            detail = f"{count} 条术语" if count is not None else "运行前自动核验"
+            self.glossary_summary.set(f"{Path(self.glossary_path.get()).name}\n{detail}" + (f" · {languages} 种目标语言" if languages > 0 else ""))
+        else:
+            self.glossary_summary.set("可选 · 不导入时直接翻译")
+        for widget in (self.glossary_mapping_button, self.glossary_clear_button):
+            widget.state(["!disabled"] if selected and not self._running else ["disabled"])
+
+    def choose_glossary(self):
+        if self._running:
+            return
+        path = filedialog.askopenfilename(title="导入自己的术语表", filetypes=[("CSV / TSV 术语表", "*.csv *.tsv"), ("所有文件", "*.*")])
+        if path:
+            self._map_glossary(Path(path), self.glossary_columns if path == self.glossary_path.get() else None)
+
+    def edit_glossary_mapping(self):
+        if not self._running and self.glossary_path.get():
+            self._map_glossary(Path(self.glossary_path.get()), self.glossary_columns)
+
+    def _map_glossary(self, path, mapping):
+        try:
+            dialog = GlossaryDialog(self.root, path, mapping)
+            self.root.wait_window(dialog.window)
+            if dialog.result is not None:
+                self.glossary_columns, count = dialog.result
+                self.glossary_path.set(str(path))
+                self._refresh_glossary_summary(count)
+                self.form_feedback.set("")
+                self._append_log(f"已导入 {path.name}：{count} 条术语。")
+        except (OSError, ValueError) as exc:
+            self._show_form_error(str(exc), self.glossary_import_button)
+
+    def clear_glossary(self):
+        if not self._running:
+            self.glossary_path.set("")
+            self.glossary_columns = None
+            self._refresh_glossary_summary()
+
+    def export_glossary_template(self):
+        path = filedialog.asksaveasfilename(title="保存空白术语表模板", defaultextension=".csv",
+                                          initialfile="custom_terms.csv", filetypes=[("CSV 文件", "*.csv")])
+        if path:
+            try:
+                write_csv(Path(path), FRIENDLY_TERM_COLUMNS, [])
+                self._append_log(f"模板已保存：{path}")
+            except OSError as exc:
+                self._show_form_error(str(exc))
+
+    def choose_output_dir(self):
+        if not self._running:
+            path = filedialog.askdirectory(title="选择结果保存目录")
+            if path:
+                self.output_dir.set(path)
+
+    def _open_path(self, path):
+        try:
+            if path is None or not Path(path).exists():
+                raise ValueError("文件尚未生成，或已被移动。请查看输出目录。")
+            os.startfile(path)
+        except (OSError, ValueError) as exc:
+            self._show_form_error(str(exc))
+
+    def open_output_dir(self):
+        self._open_path(self._output_path.parent if self._output_path else Path(self.output_dir.get()).expanduser())
+
+    def _show_form_error(self, text, widget=None, settings=False):
+        self.form_feedback.set(text)
+        self.feedback_label.configure(foreground=self.m3_colors["error"])
+        self.workspace_tabs.select(self.settings_panel if settings else self.task_panel)
+        if widget:
+            panel = self.settings_panel if settings else self.task_panel
+            self.root.update_idletasks()
+            position = widget.winfo_rooty() - panel.content.winfo_rooty()
+            panel.canvas.yview_moveto(max(0, position - 45) / max(1, panel.content.winfo_height()))
+            widget.focus_set()
+
+    def _lock_configuration(self, locked):
+        if locked:
+            self._locked_widgets = []
+            def lock(parent):
+                for widget in parent.winfo_children():
+                    if isinstance(widget, (ttk.Entry, ttk.Button, ttk.Checkbutton, ttk.Menubutton, ttk.Combobox, ttk.Spinbox)):
+                        self._locked_widgets.append((widget, widget.state()))
+                        widget.state(["disabled"])
+                    elif isinstance(widget, Text):
+                        self._locked_widgets.append((widget, widget.cget("state")))
+                        widget.configure(state="disabled")
+                    lock(widget)
+            lock(self.task_panel)
+            lock(self.settings_panel)
+            self.api_key_entry.configure(show="*")
+            self.api_visibility_button.configure(text="显示")
+        else:
+            for widget, state in self._locked_widgets:
+                if isinstance(widget, Text):
+                    widget.configure(state=state)
+                else:
+                    widget.state(["!disabled", "!readonly"])
+                    widget.state(state)
+            self._locked_widgets = []
+            self._refresh_glossary_summary()
+
+    def run(self):
+        if self._running:
+            return
+        self.form_feedback.set("")
+        try:
+            input_path = Path(self.input_path.get().strip()).expanduser()
+            preview = inspect_input(input_path, self.force_translate_all.get(), self.overwrite.get())
+            self._display_preview(preview)
+        except (OSError, ValueError) as exc:
+            self._show_form_error(str(exc), self.input_entry)
+            return
+        if preview[2]["groups"] == 0:
+            self.status_title.set("没有待处理文本")
+            self.status_detail.set("目标单元格已有译文，或行被标记为不翻译。可调整翻译偏好后重试。")
+            self.progress_text.set("未发起翻译请求")
+            return
+        if not self.llm_api_key.get().strip():
+            self._show_form_error("请填写 API Key 后开始翻译。", self.api_key_entry, settings=True)
+            return
+        invalid_field = self.endpoint_entry
+        try:
+            endpoint = validate_endpoint(self.llm_endpoint.get())
+            invalid_field = self.model_entry
+            if not self.llm_model.get().strip():
+                raise ValueError("请填写服务商提供的模型名称。")
+            invalid_field = self.threads_spinbox
+            threads = bounded_integer(self.llm_threads.get(), "并发请求数", 1, 16)
+            invalid_field = self.flush_spinbox
+            interval = bounded_integer(self.flush_interval.get(), "自动保存间隔", 1, 50)
+        except ValueError as exc:
+            if "整数" in str(exc) and not self._advanced_open:
+                self._toggle_advanced()
+            self._show_form_error(str(exc), invalid_field, settings=True)
+            return
+        self._sync_extra_prompt()
+        try:
+            if not self.output_dir.get().strip():
+                raise ValueError("请选择输出目录。")
+            output_dir = Path(self.output_dir.get().strip()).expanduser()
+            output_dir.mkdir(parents=True, exist_ok=True)
+            term_path = Path(self.glossary_path.get()).expanduser() if self.glossary_path.get() else None
+            if term_path:
+                _, terms = read_glossary(term_path, self.glossary_columns)
+                self._refresh_glossary_summary(len(terms))
+        except (OSError, ValueError) as exc:
+            self._show_form_error(str(exc))
+            return
+        self._stop_event = threading.Event()
+        config = Stage2Config(
+            input_path=input_path, term_path=term_path,
+            output_path=output_dir / f"{input_path.stem}_direct.csv",
+            report_path=output_dir / f"{input_path.stem}_direct_report.csv",
+            endpoint=endpoint, api_key=self.llm_api_key.get().strip(), model=self.llm_model.get().strip(),
+            threads=threads, flush_interval=interval, use_terms=term_path is not None,
+            term_columns=dict(self.glossary_columns) if self.glossary_columns is not None else None,
+            include_false=self.force_translate_all.get(), overwrite=self.overwrite.get(),
+            extra_prompt=self.extra_prompt.get(), progress_callback=self._queue_stage2_progress, stop_event=self._stop_event,
+        )
+        try:
+            self._save_settings()
+        except OSError as exc:
+            self._append_log(f"设置未能保存，本次仍可继续：{exc}")
+        self._preview_generation += 1
+        if self._preview_after:
+            self.root.after_cancel(self._preview_after)
+            self._preview_after = None
+        self._run_summary_groups = preview[2]["groups"]
+        self._active_config = config
+        self._running, self._state = True, "running"
+        self._progress_limit = 90 if self.run_stage3.get() else 100
+        self._started_at = time.monotonic()
+        self.elapsed_text.set("00:00")
+        self._output_path = self._report_path = None
+        self.result_card.pack_forget()
+        self._lock_configuration(True)
+        self.status_label.configure(style="Status.TLabel")
+        self.status_title.set("正在准备")
+        self.status_detail.set("正在读取术语与已保存的进度…")
+        self.progress.configure(mode="indeterminate", value=0)
+        self.progress.start(12)
+        self.count_text.set(f"0 / {preview[2]['groups']}")
+        self.progress_text.set("准备中")
+        self.run_button.configure(text="翻译中…", state="disabled")
+        self.stop_button.configure(text="暂停", state="normal")
+        self._append_log("开始本次任务。")
+        self.workspace_tabs.select(self.task_panel)
+        threading.Thread(target=self._run_worker, args=(config, self.run_stage3.get()), daemon=True).start()
+
+    def stop(self):
+        if not self._running or self._stop_event is None or self._state == "pausing":
+            return
+        self._state = "pausing"
+        self._stop_event.set()
+        self.stop_button.configure(text="正在保存…", state="disabled")
+        self.status_title.set("正在暂停")
+        self.status_detail.set("不再发起新请求；等待正在处理的译文返回并保存后，即可继续。")
+        self._append_log("已请求暂停，将保存正在完成的译文。")
+
+    def _run_worker(self, config, stage3_enabled):
+        try:
+            stats = {"direct": run_stage2(config)}
+            if config.stop_event and config.stop_event.is_set():
+                raise Stage2Paused()
+            if stage3_enabled:
+                self._messages.put(("validating", None))
+                stats["stage3"] = validate_and_fix(
+                    input_path=config.output_path,
+                    output_path=config.output_path.with_name(f"{config.input_path.stem}_validated.csv"),
+                    report_path=config.output_path.with_name(f"{config.input_path.stem}_validation_report.csv"),
+                )
+            self._messages.put(("done", stats))
+        except Stage2Paused:
+            self._messages.put(("paused", None))
+        except Exception as exc:
+            self._messages.put(("error", "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))))
+
+    def _queue_stage2_progress(self, message, completed, total):
+        self._messages.put(("stage_progress", (message, completed, total)))
+
+    def _redact(self, message):
+        for secret in (self.llm_api_key.get().strip(), getattr(self._active_config, "api_key", "")):
+            if secret:
+                message = message.replace(secret, "[API Key]")
+        return message
+
+    def _append_log(self, message):
+        message = self._redact(message)
+        at_bottom = self.log_text.yview()[1] >= 0.98
         self.log_text.configure(state="normal")
-        ts = time.strftime("%H:%M:%S")
-        self.log_text.insert("end", f"[{ts}] {message}\n")
-        self.log_text.see("end")
+        self.log_text.insert("end", f"[{time.strftime('%H:%M:%S')}] {message}\n")
+        lines = int(self.log_text.index("end-1c").split(".")[0])
+        if lines > 5000:
+            self.log_text.delete("1.0", f"{lines-4000}.0")
+        if at_bottom:
+            self.log_text.see("end")
         self.log_text.configure(state="disabled")
 
-    def _clear_log(self) -> None:
-        if self.log_text is None:
-            return
+    def _clear_log(self):
         self.log_text.configure(state="normal")
         self.log_text.delete("1.0", "end")
         self.log_text.configure(state="disabled")
 
-    def _queue_log(self, message: str) -> None:
-        self._messages.put(("log", message))
+    def _copy_log(self):
+        self.root.clipboard_clear()
+        self.root.clipboard_append(self.log_text.get("1.0", "end-1c"))
+        self.form_feedback.set("日志已复制。")
+        self.feedback_label.configure(foreground=self.m3_colors["on_success_container"])
 
-    def _queue_progress(self, value: float) -> None:
-        self._messages.put(("progress", max(0.0, min(100.0, value))))
+    def _tick(self):
+        if self._running and self._started_at is not None:
+            self.elapsed_text.set(duration_label(time.monotonic() - self._started_at))
+        self.root.after(1000, self._tick)
 
-    def _queue_stage2_progress(self, message: str, completed: int | None, total: int | None) -> None:
-        self._queue_log(message)
-        if total and total > 0 and completed is not None:
-            ratio = completed / total
-            self._queue_progress(ratio * 100.0)
+    def _show_results(self):
+        has_output = self._output_path is not None and self._output_path.is_file()
+        has_report = self._report_path is not None and self._report_path.is_file()
+        if has_output or has_report:
+            self.result_card.pack(before=self.detail_tabs, fill="x", pady=(0, 12))
+        self.result_button.state(["!disabled"] if has_output else ["disabled"])
+        self.report_button.state(["!disabled"] if has_report else ["disabled"])
 
-    def choose_input(self) -> None:
-        path = filedialog.askopenfilename(
-            title="选择输入 CSV",
-            filetypes=[("CSV 文件", "*.csv"), ("所有文件", "*.*")],
-        )
-        if path:
-            self.input_path.set(path)
-            self._add_recent_file(path)
-            if not self.output_dir.get():
-                self.output_dir.set(str(Path(path).parent / "outputs"))
+    def _handle_message(self, kind, payload):
+        if kind == "preview":
+            generation, result, error = payload
+            if generation != self._preview_generation:
+                return
+            if error:
+                self.input_summary.set(error)
+                self.input_summary_label.configure(style="Error.CardCaption.TLabel")
+                self.input_tree.delete(*self.input_tree.get_children())
+            else:
+                self._display_preview(result)
+            return
+        if kind == "stage_progress":
+            message, completed, total = payload
+            self._append_log(message)
+            if completed is not None and total:
+                if str(self.progress["mode"]) == "indeterminate":
+                    self.progress.stop()
+                    self.progress.configure(mode="determinate", value=0)
+                self.progress.configure(value=max(float(self.progress["value"]), completed / total * self._progress_limit))
+                self.count_text.set(f"{completed} / {total}")
+                self.progress_text.set(f"已处理 {completed} / {total} 组")
+            if self._state != "pausing":
+                self.status_title.set("正在翻译" if completed else "正在准备")
+                self.status_detail.set(message[:150])
+            return
+        if kind == "validating":
+            self.status_title.set("正在检查译文")
+            self.status_detail.set("正在检查格式标签和重复源文的一致性。")
+            self.progress.configure(value=95)
+            return
+        if kind not in ("done", "paused", "error"):
+            return
+        self._running = False
+        self.progress.stop()
+        self.progress.configure(mode="determinate")
+        if self._started_at is not None:
+            self.elapsed_text.set(duration_label(time.monotonic() - self._started_at))
+        self.stop_button.configure(text="暂停", state="disabled")
+        self._lock_configuration(False)
+        self._state = kind
+        if self._active_config:
+            self._output_path = self._active_config.output_path
+            self._report_path = self._active_config.report_path
+        if kind == "done":
+            direct, stage3 = payload["direct"], payload.get("stage3", {})
+            review = direct["manual_review"]
+            inconsistent = len(stage3.get("consistency_errors", []))
+            self.status_title.set("已完成，建议复核" if review or inconsistent else "翻译完成")
+            self.status_label.configure(style="Paused.Status.TLabel" if review or inconsistent else "Success.Status.TLabel")
+            self.status_detail.set(f"填写 {direct['stage2_filled_cells']} 个单元格 · {review} 组待复核" +
+                                   (f" · {inconsistent} 处译文不一致" if inconsistent else ""))
+            if stage3.get("protected_changes"):
+                self._output_path = Path(stage3["output_path"])
+            self.progress.configure(value=100)
+            self.progress_text.set("结果已保存")
+            self.count_text.set(f"{self._run_summary_groups} / {self._run_summary_groups}")
+            self.run_button.configure(text="再次处理", state="normal")
+            self.result_summary.set(self._output_path.name)
+            self._append_log(f"{self.status_detail.get()}\n结果：{self._output_path}\n报告：{self._report_path}")
+            if stage3.get("report_path"):
+                self._append_log(f"后处理报告：{stage3['report_path']}")
+        elif kind == "paused":
+            self.status_title.set("已暂停 · 进度已保存")
+            self.status_label.configure(style="Paused.Status.TLabel")
+            self.status_detail.set("点击「继续翻译」从已保存的位置继续；更换输入或配置会重新开始。")
+            self.progress_text.set("已安全暂停")
+            self.run_button.configure(text="继续翻译", state="normal")
+            self.result_summary.set("当前已保存的部分结果")
+            self._append_log("已暂停，当前进度已保存。")
+        else:
+            self.status_title.set("本次处理未完成")
+            self.status_label.configure(style="Error.Status.TLabel")
+            self.status_detail.set(self._redact(str(payload).strip().splitlines()[-1][:200]))
+            self.progress_text.set("请查看日志并调整设置")
+            self.run_button.configure(text="重试", state="normal")
+            self.result_summary.set("输出目录中的文件（本次未完成）")
+            self._append_log(str(payload))
+            self.detail_tabs.select(self.log_tab)
+        self._show_results()
+        if self._close_requested:
+            self._finish_close()
 
-    def choose_output_dir(self) -> None:
-        path = filedialog.askdirectory(title="选择输出目录")
-        if path:
-            self.output_dir.set(path)
+    def _poll_messages(self):
+        started = time.monotonic()
+        for _ in range(250):
+            try:
+                kind, payload = self._messages.get_nowait()
+            except queue.Empty:
+                break
+            self._handle_message(kind, payload)
+            if self._close_requested and not self._running:
+                return
+            if time.monotonic() - started > 0.025:
+                break
+        self.root.after(15 if not self._messages.empty() else 80, self._poll_messages)
 
-    def open_output_dir(self) -> None:
-        output_dir = Path(self.output_dir.get()).expanduser()
-        output_dir.mkdir(parents=True, exist_ok=True)
-        os.startfile(output_dir)
-
-    def show_help(self) -> None:
-        help_text = (
-            "使用说明\n"
-            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-            "1. 选择输入 CSV 和输出目录。\n"
-            "2. 填写 LLM 选项（Endpoint / Model / API Key）。\n"
-            "3. 按需勾选翻译选项，点击「开始翻译」。\n"
-            "4. 运行中可暂停，再次点击继续从断点续跑。\n"
-            "\n"
-            "翻译选项\n"
-            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-            "• 覆盖已有：即使已有译文也重新填充。\n"
-            "• 强制全部翻译：所有行都参与翻译。\n"
-            "• 后处理验证：修正 token 并检查一致性。\n"
-            "\n"
-            "处理逻辑\n"
-            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-            "• 不查询术语表，所有翻译由 LLM 直接生成。\n"
-            "• 按唯一中文分组，每组一次返回 15 国语言。\n"
-            "• 自动保留 <...>、{...}、\\n 等格式标签。\n"
-            "\n"
-            "输出\n"
-            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-            "• 翻译结果：*_direct.csv\n"
-            "• 报告：*_direct_report.csv\n"
-            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-        )
-        messagebox.showinfo("使用说明", help_text)
-
-    def _show_api_key_missing(self) -> None:
-        """Show an M3-styled error dialog when API key is missing, with a link to buy credits."""
-        c = self.m3_colors
-        dialog = Toplevel(self.root)
-        dialog.title("缺少 API Key")
-        dialog.geometry("520x300")
-        dialog.minsize(460, 260)
-        dialog.transient(self.root)
-        dialog.grab_set()
-        dialog.resizable(False, False)
-        try:
-            dialog.configure(background=c["background"])
-        except Exception:
-            pass
-
-        body = ttk.Frame(dialog, padding=24)
-        body.pack(fill="both", expand=True)
-
-        banner = ttk.Frame(body, style="Card.TFrame")
-        banner.pack(fill="x")
-        try:
-            banner.configure(background=c["error_container"])
-        except Exception:
-            pass
-        head = ttk.Label(
-            banner,
-            text="⚠  缺少 API Key",
-            style="M3Error.TLabel",
-        )
-        head.pack(anchor="w", padx=14, pady=12)
-        try:
-            head.configure(background=c["error_container"])
-        except Exception:
-            pass
-
-        ttk.Label(
-            body,
-            text="本工具需要调用 LLM API 才能翻译。\n请在「LLM 选项」中填写 API Key 后再开始。",
-            style="Subtitle.TLabel",
-            wraplength=460,
-        ).pack(anchor="w", pady=(16, 14))
-
-        link = ttk.Label(
-            body,
-            text="还没有 Key？前往 platform.deepseek.com 购买（少量充值即可）",
-            style="Subtitle.TLabel",
-            foreground=c["primary"],
-            cursor="hand2",
-            wraplength=460,
-        )
-        link.pack(anchor="w", pady=(0, 18))
-        link.bind("<Button-1>", lambda _event: webbrowser.open(DEEPSEEK_BUY_URL))
-
-        btns = ttk.Frame(body)
-        btns.pack(fill="x", side="bottom")
-        ttk.Button(
-            btns,
-            text="前往 DeepSeek 购买",
-            style="Outline.TButton",
-            command=lambda: webbrowser.open(DEEPSEEK_BUY_URL),
-        ).pack(side="left")
-        ttk.Button(
-            btns,
-            text="我知道了",
-            style="M3.TButton",
-            command=dialog.destroy,
-        ).pack(side="right")
-
-        dialog.protocol("WM_DELETE_WINDOW", dialog.destroy)
-
-    def run(self) -> None:
+    def _on_close(self):
         if self._running:
+            if not self._close_requested and messagebox.askokcancel(
+                "暂停并退出", "任务仍在运行。是否停止派发新请求，等待当前译文保存后退出？", parent=self.root
+            ):
+                self._close_requested = True
+                self.stop()
             return
-        input_path = Path(self.input_path.get()).expanduser()
-        if not input_path.is_file():
-            messagebox.showerror("缺少输入文件", "请先上传一个有效的 CSV 文件。")
-            return
-        if not self.llm_api_key.get().strip():
-            self._show_api_key_missing()
-            return
-        self._sync_extra_prompt()
+        self._finish_close()
+
+    def _finish_close(self):
         try:
             self._save_settings()
-        except Exception as exc:
-            self._append_log(f"保存 LLM 配置失败：{exc}")
+        except (OSError, TclError):
+            pass
+        self.root.destroy()
 
-        output_dir = Path(self.output_dir.get()).expanduser()
-        output_dir.mkdir(parents=True, exist_ok=True)
-        stem = input_path.stem
-        direct_output_path = output_dir / f"{stem}_direct.csv"
-        direct_report_path = output_dir / f"{stem}_direct_report.csv"
-        stage3_report_path = output_dir / f"{stem}_validation_report.csv"
-        stage3_fixed_path = output_dir / f"{stem}_validated.csv"
+    def show_help(self):
+        messagebox.showinfo("使用说明",
+            "1. 选择多语言文本管理导出的 UTF-8 CSV，在右侧检查预览。\n"
+            "2. 可选导入自己的 CSV / TSV 术语表，在映射窗口选择语言列。\n"
+            "3. 在「模型设置」填写服务地址、模型名称和 API Key。\n"
+            "4. 点击「开始翻译」；完成后可直接打开结果和报告。\n\n"
+            "默认只填空白译文，并跳过不翻译的行。暂停会等待当前请求返回并保存。\n"
+            "术语、输入或配置变化后会重新开始处理。项目不附带原神术语表。\n\n"
+            "快捷键：Ctrl+O 选择文件；Ctrl+Enter 开始 / 继续；Ctrl+. 暂停。\n"
+            "完整提示词与格式说明见 README.md。", parent=self.root)
 
-        # Placeholder argument only; use_terms=False means it is never read.
-        dummy_term_path = Path("")
-
-        self._running = True
-        self._stop_event = threading.Event()
-        self.run_button.configure(text="翻译中...", state="disabled")
-        self.stop_button.configure(text="暂停", state="normal")
-        self.progress.configure(value=0)
-        self._append_log("开始翻译。不查询术语表，所有翻译直接由 LLM 生成。")
-
-        thread = threading.Thread(
-            target=self._run_worker,
-            args=(
-                input_path,
-                dummy_term_path,
-                direct_output_path,
-                direct_report_path,
-                stage3_report_path,
-                stage3_fixed_path,
-            ),
-            daemon=True,
-        )
-        thread.start()
-
-    def stop(self) -> None:
-        if not self._running or self._stop_event is None:
-            return
-        self._stop_event.set()
-        self.stop_button.configure(state="disabled")
-        self._append_log("正在请求暂停，请等待当前任务完成...")
-
-    def _run_worker(
-        self,
-        input_path: Path,
-        term_path: Path,
-        direct_output_path: Path,
-        direct_report_path: Path,
-        stage3_report_path: Path,
-        stage3_fixed_path: Path,
-    ) -> None:
-        try:
-            stats: dict[str, object] = {}
-            stage3_enabled = bool(self.run_stage3.get())
-
-            if bool(self.force_translate_all.get()):
-                self._queue_log("正在强制翻译所有行：将「是否需要翻译」列全部改为 TRUE。")
-                fieldnames, rows = read_input(input_path)
-                for row in rows:
-                    row[NEED_TRANSLATE_COLUMN] = "TRUE"
-                forced_path = direct_output_path.with_name(f"{input_path.stem}_forced.csv")
-                write_csv(forced_path, fieldnames, rows)
-                input_path = forced_path
-                self._queue_log(f"强制翻译文件已生成：{forced_path}")
-
-            self._queue_log(
-                "开始直接翻译。"
-                f"线程数 {int(self.llm_threads.get())}，"
-                f"模型 {self.llm_model.get().strip() or DEFAULT_MODEL}。"
-            )
-            stage2_stats = run_stage2(
-                Stage2Config(
-                    input_path=input_path,
-                    term_path=term_path,
-                    output_path=direct_output_path,
-                    report_path=direct_report_path,
-                    endpoint=self.llm_endpoint.get().strip() or DEFAULT_ENDPOINT,
-                    api_key=self.llm_api_key.get().strip(),
-                    model=self.llm_model.get().strip() or DEFAULT_MODEL,
-                    threads=int(self.llm_threads.get()),
-                    use_terms=False,
-                    include_false=False,
-                    overwrite=bool(self.overwrite.get()),
-                    progress_callback=self._queue_stage2_progress,
-                    stop_event=self._stop_event,
-                    flush_interval=int(self.flush_interval.get()),
-                    extra_prompt=self.extra_prompt.get().strip(),
-                )
-            )
-            stats["direct"] = stage2_stats
-            self._queue_progress(66.6 if stage3_enabled else 100.0)
-            self._queue_log(
-                "翻译完成。"
-                f"填写空白单元格 {stage2_stats['stage2_filled_cells']}，"
-                f"需人工复核 {stage2_stats['manual_review']}。"
-            )
-
-            if self._stop_event and self._stop_event.is_set():
-                raise Stage2Paused()
-
-            if stage3_enabled:
-                self._queue_log("第三阶段：开始后处理验证。")
-                stage3_result = validate_and_fix(
-                    input_path=direct_output_path,
-                    output_path=stage3_fixed_path,
-                    report_path=stage3_report_path,
-                )
-                stats["stage3"] = stage3_result
-                changes = stage3_result.get("protected_changes", [])
-                errors = stage3_result.get("consistency_errors", [])
-                self._queue_progress(100.0)
-                self._queue_log(
-                    "第三阶段：完成。"
-                    f"修正 protected token {len(changes)} 处，"
-                    f"发现不一致 {len(errors)} 处。"
-                )
-                if errors:
-                    self._queue_log("第三阶段：发现翻译不一致，请查看验证报告。")
-
-            self._messages.put(("done", stats))
-        except Stage2Paused:
-            self._messages.put(("paused", {}))
-        except Exception as exc:
-            error_text = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
-            self._messages.put(("error", error_text))
-
-    def _poll_messages(self) -> None:
-        try:
-            kind, payload = self._messages.get_nowait()
-        except queue.Empty:
-            self.root.after(150, self._poll_messages)
-            return
-
-        if kind == "log":
-            self._append_log(str(payload))
-            self.root.after(150, self._poll_messages)
-            return
-        if kind == "progress":
-            self.progress.configure(value=float(payload))
-            self.root.after(150, self._poll_messages)
-            return
-
-        self._running = False
-        self.stop_button.configure(text="暂停", state="disabled")
-        if kind == "done":
-            self.progress.configure(value=100)
-            self.run_button.configure(text="开始翻译", state="normal")
-            stats = payload
-            lines = ["处理完成。"]
-            direct = stats.get("direct") if isinstance(stats, dict) else None
-            if isinstance(direct, dict):
-                lines.extend(
-                    [
-                        "直接翻译：",
-                        f"  唯一中文：{direct['stage2_unique_source_texts']}",
-                        f"  填写空白单元格：{direct['stage2_filled_cells']}",
-                        f"  需人工复核：{direct['manual_review']}",
-                        f"  最终输出：{direct['output']}",
-                        f"  报告：{direct['stage2_report']}",
-                        f"  运行日志：{direct['stage2_run_log']}",
-                    ]
-                )
-            stage3 = stats.get("stage3") if isinstance(stats, dict) else None
-            if isinstance(stage3, dict):
-                changes = stage3.get("protected_changes", [])
-                errors = stage3.get("consistency_errors", [])
-                lines.extend(
-                    [
-                        "第三阶段：",
-                        f"  修正 protected token：{len(changes)}",
-                        f"  不一致错误：{len(errors)}",
-                        f"  修正输出：{stage3.get('output_path') or '无'}",
-                        f"  验证报告：{stage3.get('report_path') or '无'}",
-                    ]
-                )
-            self._append_log("\n".join(lines))
-            messagebox.showinfo("完成", "CSV 已处理完成。")
-        elif kind == "paused":
-            self.run_button.configure(text="继续翻译", state="normal")
-            self._append_log("处理已暂停。进度已保存，可以点击「继续翻译」续跑。")
-            messagebox.showinfo("已暂停", "处理已暂停。进度已保存，可点击「继续翻译」续跑。")
-        else:
-            self.run_button.configure(text="开始翻译", state="normal")
-            self._append_log("处理失败，错误详情如下：")
-            self._append_log(str(payload))
-            messagebox.showerror("处理失败", str(payload).splitlines()[-1] if str(payload).splitlines() else str(payload))
-        self.root.after(150, self._poll_messages)
-
-    def mainloop(self) -> None:
+    def mainloop(self):
         self.root.mainloop()
 
 

@@ -35,8 +35,11 @@ class ScrollableFrame(ttk.Frame):
         self._window = self.canvas.create_window((0, 0), window=self.inner, anchor="nw")
         self.inner.bind("<Configure>", self._on_inner_configure)
         self.canvas.bind("<Configure>", self._on_canvas_configure)
-        self.bind("<Enter>", lambda _e: self.bind_all("<MouseWheel>", self._on_wheel))
-        self.bind("<Leave>", lambda _e: self.unbind_all("<MouseWheel>"))
+        # Bind on this toplevel, filtering by ancestry. Never remove another
+        # widget's global wheel binding or steal wheel events from text editors.
+        self._wheel_owner = self.winfo_toplevel()
+        self._wheel_binding = self._wheel_owner.bind("<MouseWheel>", self._on_wheel, add="+")
+        self.bind("<Destroy>", self._cleanup_wheel, add="+")
 
     @property
     def content(self) -> ttk.Frame:
@@ -48,8 +51,25 @@ class ScrollableFrame(ttk.Frame):
     def _on_canvas_configure(self, event) -> None:
         self.canvas.itemconfig(self._window, width=event.width)
 
-    def _on_wheel(self, event) -> None:
-        self.canvas.yview_scroll(int(-event.delta / 120), "units")
+    def _cleanup_wheel(self, event):
+        if event.widget is self:
+            try:
+                self._wheel_owner.unbind("<MouseWheel>", self._wheel_binding)
+            except tk.TclError:
+                pass
+
+    def _on_wheel(self, event):
+        widget = event.widget
+        if isinstance(widget, (tk.Text, ttk.Treeview, ttk.Combobox, ttk.Spinbox)):
+            return
+        while widget is not None and widget is not self:
+            widget = getattr(widget, "master", None)
+        if widget is not self or self.inner.winfo_height() <= self.canvas.winfo_height():
+            return
+        if event.delta:
+            steps = max(1, abs(int(event.delta / 120)))
+            self.canvas.yview_scroll(-steps if event.delta > 0 else steps, "units")
+            return "break"
 
 
 def _rgb(h: str) -> tuple[int, int, int]:
@@ -217,7 +237,7 @@ def apply_m3_theme(root) -> dict[str, str]:
     s.configure("Subtitle.TLabel", background=c["background"],
                 foreground=c["text_secondary"], font=(fam, 11))
     s.configure("Title.TLabel", background=c["background"],
-                foreground=c["text"], font=(fam, 21, "bold"))
+                foreground=c["text"], font=(fam, 18, "bold"))
     s.configure("Headline.TLabel", background=c["background"],
                 foreground=c["text"], font=(fam, 15, "bold"))
     s.configure("M3Error.TLabel", background=c["error_container"],
@@ -238,7 +258,7 @@ def apply_m3_theme(root) -> dict[str, str]:
                 font=(fam, 10, "bold"))
 
     # --- buttons ---
-    btn_pad = (20, 9)
+    btn_pad = (14, 8)
     btn_font = (fam, 10, "bold")
     btn_font_reg = (fam, 10)
 
@@ -377,7 +397,7 @@ def apply_m3_theme(root) -> dict[str, str]:
     # --- treeview ---
     s.configure("Treeview", background=c["surface"],
                 foreground=c["text"], fieldbackground=c["surface"],
-                borderwidth=0, rowheight=28)
+                borderwidth=0, rowheight=max(28, int(22 * float(root.tk.call("tk", "scaling")))))
     s.configure("Treeview.Heading", background=c["surface_container_low"],
                 foreground=c["text_secondary"], borderwidth=0, relief="flat",
                 font=(fam, 9, "bold"))
@@ -402,4 +422,23 @@ def apply_m3_theme(root) -> dict[str, str]:
     s.configure("TLabelframe.Label", background=c["surface"],
                 foreground=c["primary"], font=(fam, 10, "bold"))
 
+    # Workbench surfaces and compact, secondary actions.
+    s.configure("Card.TLabel", background=c["surface"], foreground=c["text"])
+    s.configure("CardCaption.TLabel", background=c["surface"], foreground=c["text_secondary"], font=(fam, 9))
+    s.configure("Section.TLabel", background=c["surface"], foreground=c["text"], font=(fam, 11, "bold"))
+    s.configure("Metric.TLabel", background=c["surface"], foreground=c["text"], font=(fam, 18, "bold"))
+    s.configure("Status.TLabel", background=c["surface"], foreground=c["primary"], font=(fam, 15, "bold"))
+    s.configure("Success.Status.TLabel", foreground=c["on_success_container"])
+    s.configure("Error.Status.TLabel", foreground=c["error"])
+    s.configure("Paused.Status.TLabel", foreground="#8A5700")
+    s.configure("Error.CardCaption.TLabel", foreground=c["error"])
+    s.configure("Compact.TButton", padding=(10, 5), font=(fam, 9))
+    s.configure("TNotebook", background=c["background"], borderwidth=0, tabmargins=(0, 0, 0, 8))
+    s.configure("TNotebook.Tab", background=c["surface_container"], foreground=c["text_secondary"],
+                padding=(18, 9), font=(fam, 10, "bold"))
+    s.map("TNotebook.Tab", background=[("selected", c["primary_container"])],
+          foreground=[("selected", c["primary"])])
+    s.map("TEntry", fieldbackground=[("disabled", c["disabled_bg"]), ("readonly", c["surface_container_low"])])
+    s.map("TCombobox", fieldbackground=[("readonly", c["surface"]), ("disabled", c["disabled_bg"])],
+          foreground=[("disabled", c["disabled_fg"]), ("readonly", c["text"])])
     return c
